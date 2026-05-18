@@ -14,6 +14,22 @@ const HOST_ENV: &str = "LLAMA_CPP_HOST";
 const API_KEY_ENV: &str = "LLAMA_CPP_API_KEY";
 const HOST_NOT_SET: &str = "LLAMA_CPP_HOST not set";
 
+fn extract_context_window(model: &Value) -> Option<u32> {
+    if let Some(n_ctx) = model.get("meta").and_then(|m| m.get("n_ctx")).and_then(|v| v.as_u64()) {
+        return Some(n_ctx as u32);
+    }
+    if let Some(args) = model.get("status").and_then(|s| s.get("args")).and_then(|a| a.as_array()) {
+        for i in 0..args.len().saturating_sub(1) {
+            if args[i].as_str() == Some("--ctx-size")
+                && let Some(val) = args[i + 1].as_str().and_then(|s| s.parse::<u32>().ok())
+            {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     api_key_env: "",
     base_url: "http://localhost:8080/v1",
@@ -107,7 +123,27 @@ impl Provider for LlamaCpp {
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<String>, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            self.compat.do_list_models(&auth).await
+            let body = self.compat.do_list_models_raw(&auth).await?;
+            let mut models: Vec<String> = body["data"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| {
+                            let id = m["id"].as_str().map(String::from)?;
+                            if let Some(ctx) = extract_context_window(m) {
+                                crate::context_windows::set_context_window(
+                                    crate::provider::ProviderKind::LlamaCpp,
+                                    id.clone(),
+                                    ctx,
+                                );
+                            }
+                            Some(id)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            models.sort();
+            Ok(models)
         })
     }
 

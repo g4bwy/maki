@@ -210,12 +210,15 @@ impl Model {
                     e.max_output_tokens,
                     e.context_window,
                 ),
-                None => (
-                    provider.family(),
-                    ModelPricing::ZERO,
-                    provider.fallback_max_output(),
-                    provider.fallback_context_window(),
-                ),
+                None => {
+                    let ctx = crate::context_windows::get_context_window(provider, model_id);
+                    (
+                        provider.family(),
+                        ModelPricing::ZERO,
+                        provider.fallback_max_output(),
+                        ctx.unwrap_or_else(|| provider.fallback_context_window()),
+                    )
+                }
             };
             return Ok(Self {
                 id: model_id.to_string(),

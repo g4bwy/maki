@@ -125,14 +125,8 @@ impl OpenAiCompatProvider {
         }
     }
 
-    pub async fn do_list_models(&self, auth: &ResolvedAuth) -> Result<Vec<String>, AgentError> {
-        let request = self.build_request("GET", "/models", auth).body(())?;
-        let mut response = self.client.send_async(request).await?;
-        if response.status().as_u16() != 200 {
-            return Err(AgentError::from_response(response).await);
-        }
-
-        let body: Value = serde_json::from_str(&response.text().await?)?;
+   pub async fn do_list_models(&self, auth: &ResolvedAuth) -> Result<Vec<String>, AgentError> {
+        let body = self.do_list_models_raw(auth).await?;
         let mut models: Vec<String> = body["data"]
             .as_array()
             .map(|arr| {
@@ -143,6 +137,16 @@ impl OpenAiCompatProvider {
             .unwrap_or_default();
         models.sort();
         Ok(models)
+    }
+
+    pub async fn do_list_models_raw(&self, auth: &ResolvedAuth) -> Result<Value, AgentError> {
+        let request = self.build_request("GET", "/models", auth).body(())?;
+        let mut response = self.client.send_async(request).await?;
+        if response.status().as_u16() != 200 {
+            return Err(AgentError::from_response(response).await);
+        }
+        let body: Value = serde_json::from_str(&response.text().await?)?;
+        Ok(body)
     }
 }
 

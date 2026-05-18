@@ -1,4 +1,5 @@
 pub(crate) mod error;
+pub mod context_windows;
 pub mod model;
 pub mod provider;
 pub(crate) mod providers;
