@@ -67,6 +67,7 @@ pub(crate) struct EventLoop<'t> {
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
     warn_rx: flume::Receiver<String>,
+    model_ready_rx: flume::Receiver<Model>,
     storage_writer: Arc<StorageWriter>,
     timeouts: Timeouts,
     ui_action_rx: Option<flume::Receiver<UiAction>>,
@@ -76,13 +77,17 @@ pub(crate) struct EventLoop<'t> {
 struct BackgroundModels {
     available: Arc<ArcSwapOption<Vec<String>>>,
     warn_rx: flume::Receiver<String>,
+    model_ready_rx: flume::Receiver<Model>,
     task: smol::Task<()>,
 }
 
-fn spawn_model_fetch() -> BackgroundModels {
+fn spawn_model_fetch(model_slot: &Arc<ArcSwap<ModelSlot>>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
     let bg = Arc::clone(&available);
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
+    let (model_ready_tx, model_ready_rx) = flume::unbounded::<Model>();
+    let model_slot = Arc::clone(model_slot);
+    let tx = model_ready_tx.clone();
     let task = smol::spawn(async move {
         let warn_tx = warn_tx;
         fetch_all_models(|batch| {
@@ -97,10 +102,19 @@ fn spawn_model_fetch() -> BackgroundModels {
             bg.store(Some(Arc::new(merged)));
         })
         .await;
+
+        // Re-resolve the current model now that context_windows are populated
+        let current = model_slot.load();
+        if let Ok(updated) = Model::from_spec(&current.model.spec())
+            && updated.context_window != current.model.context_window
+        {
+            let _ = tx.try_send(updated);
+        }
     });
     BackgroundModels {
         available,
         warn_rx,
+        model_ready_rx,
         task,
     }
 }
@@ -173,7 +187,13 @@ impl<'t> EventLoop<'t> {
         std::thread::spawn(crate::highlight::warmup);
         crate::update::spawn_check();
 
-        let bg = spawn_model_fetch();
+        let provider: Arc<dyn Provider> =
+            Arc::from(from_model(&model, timeouts).context("create provider")?);
+        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model: model.clone(),
+            provider,
+        }));
+        let bg = spawn_model_fetch(&model_slot);
         let storage_writer = Arc::new(StorageWriter::new(storage.clone()));
         let (shell_tx, shell_rx) = flume::unbounded::<ShellEvent>();
 
@@ -181,12 +201,6 @@ impl<'t> EventLoop<'t> {
         let initial_history = session.messages.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 
-        let provider: Arc<dyn Provider> =
-            Arc::from(from_model(&model, timeouts).context("create provider")?);
-        let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
-            model: model.clone(),
-            provider,
-        }));
         let handles = AgentHandles::spawn(
             &model_slot,
             initial_history,
@@ -238,6 +252,7 @@ impl<'t> EventLoop<'t> {
             shell_tx,
             shell_rx,
             warn_rx: bg.warn_rx,
+            model_ready_rx: bg.model_ready_rx,
             storage_writer,
             timeouts,
             ui_action_rx,
@@ -300,6 +315,10 @@ impl<'t> EventLoop<'t> {
 
         while let Ok(warning) = self.warn_rx.try_recv() {
             self.app.flash(warning);
+        }
+
+        while let Ok(updated_model) = self.model_ready_rx.try_recv() {
+            self.app.update_model(&updated_model);
         }
 
         if let Some(rx) = &self.ui_action_rx {
