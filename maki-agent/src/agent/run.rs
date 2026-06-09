@@ -363,6 +363,7 @@ impl Agent {
             &mut self.history,
             &self.event_tx,
             &self.cancel,
+            self.config.compaction_buffer,
         )
         .await?;
         self.rollback_len = self.history.len();

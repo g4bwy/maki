@@ -151,8 +151,14 @@ impl AgentLoop {
 
     async fn do_compact(&mut self, event_tx: &EventSender) -> Result<(), AgentError> {
         let slot = self.model_slot.load();
-        let result =
-            agent::compact(&*slot.provider, &slot.model, &mut self.history, event_tx).await;
+        let result = agent::compact(
+            &*slot.provider,
+            &slot.model,
+            &mut self.history,
+            event_tx,
+            self.config.compaction_buffer,
+        )
+        .await;
         self.sync_shared_history();
         result
     }
