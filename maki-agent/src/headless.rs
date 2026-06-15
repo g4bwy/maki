@@ -184,6 +184,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     timeouts: params.timeouts,
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(params.prompt_slots),
+                    subagent_semaphore: None,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -376,6 +377,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         timeouts: params.timeouts,
                         file_tracker: Arc::clone(&file_tracker),
                         prompt_slots: Arc::clone(&params.prompt_slots),
+                        subagent_semaphore: None,
                     },
                     AgentRunParams {
                         history: &mut history,

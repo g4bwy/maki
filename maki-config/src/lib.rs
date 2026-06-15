@@ -27,6 +27,7 @@ pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: u32 = 40_000;
 pub const DEFAULT_SEARCH_RESULT_LIMIT: usize = 100;
 pub const DEFAULT_INTERPRETER_MAX_MEMORY_MB: usize = 50;
+pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: u32 = 0;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -48,6 +49,7 @@ pub const MIN_MAX_CONTINUATION_TURNS: u32 = 1;
 pub const MIN_COMPACTION_BUFFER: u32 = 1_000;
 pub const MIN_SEARCH_RESULT_LIMIT: usize = 10;
 pub const MIN_INTERPRETER_MAX_MEMORY_MB: usize = 10;
+pub const MIN_MAX_CONCURRENT_SUBAGENTS: u32 = 0;
 pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
 pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
@@ -318,6 +320,7 @@ pub struct AgentFileConfig {
     pub compaction_buffer: Option<u32>,
     pub search_result_limit: Option<usize>,
     pub interpreter_max_memory_mb: Option<usize>,
+    pub max_concurrent_subagents: Option<u32>,
 }
 
 impl AgentFileConfig {
@@ -334,7 +337,8 @@ impl AgentFileConfig {
             max_continuation_turns,
             compaction_buffer,
             search_result_limit,
-            interpreter_max_memory_mb
+            interpreter_max_memory_mb,
+            max_concurrent_subagents
         );
     }
 }
@@ -661,6 +665,13 @@ pub struct AgentConfig {
 
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
+
+    #[config(
+        default = DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+        min = MIN_MAX_CONCURRENT_SUBAGENTS,
+        desc = "Max concurrent subagents (task tool). 0 means unlimited. Excess tasks wait until a slot is free"
+    )]
+    pub max_concurrent_subagents: u32,
 }
 
 impl AgentConfig {
@@ -700,6 +711,9 @@ impl AgentConfig {
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools,
+            max_concurrent_subagents: file
+                .max_concurrent_subagents
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_SUBAGENTS),
         }
     }
 

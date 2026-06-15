@@ -225,6 +225,7 @@ impl AgentLoop {
                 timeouts: self.timeouts,
                 file_tracker: Arc::clone(&self.file_tracker),
                 prompt_slots: Arc::new(prompt_slots),
+                subagent_semaphore: None,
             },
             AgentRunParams {
                 history: &mut self.history,

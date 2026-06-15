@@ -197,6 +197,7 @@ pub struct ToolContext {
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
     pub opts: RequestOptions,
+    pub subagent_semaphore: Option<Arc<async_lock::Semaphore>>,
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
@@ -610,6 +611,7 @@ pub(crate) fn interpreter_ctx(
         file_tracker,
         prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
         opts: RequestOptions::default(),
+        subagent_semaphore: None,
     }
 }
 

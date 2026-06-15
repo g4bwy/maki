@@ -38,6 +38,7 @@ pub struct AgentParams {
     pub timeouts: maki_providers::Timeouts,
     pub file_tracker: Arc<FileReadTracker>,
     pub prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    pub subagent_semaphore: Option<Arc<async_lock::Semaphore>>,
 }
 
 pub struct AgentRunParams<'h> {
@@ -74,10 +75,15 @@ pub struct Agent<'h> {
     timeouts: maki_providers::Timeouts,
     file_tracker: Arc<FileReadTracker>,
     prompt_slots: Arc<crate::prompt::ResolvedSlots>,
+    subagent_semaphore: Option<Arc<async_lock::Semaphore>>,
 }
 
 impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+        let subagent_semaphore = params.subagent_semaphore.or_else(|| {
+            let n = params.config.max_concurrent_subagents as usize;
+            (n > 0).then(|| Arc::new(async_lock::Semaphore::new(n)))
+        });
         Self {
             provider: params.provider,
             model: Arc::new(params.model),
@@ -105,6 +111,7 @@ impl<'h> Agent<'h> {
             session_id: params.session_id,
             file_tracker: params.file_tracker,
             prompt_slots: params.prompt_slots,
+            subagent_semaphore,
         }
     }
 
@@ -339,6 +346,7 @@ impl<'h> Agent<'h> {
             file_tracker: Arc::clone(&self.file_tracker),
             prompt_slots: Arc::clone(&self.prompt_slots),
             opts: self.opts,
+            subagent_semaphore: self.subagent_semaphore.clone(),
         }
     }
 
@@ -510,6 +518,7 @@ mod tests {
                 timeouts: maki_providers::Timeouts::default(),
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+                subagent_semaphore: None,
             },
             AgentRunParams {
                 history,
@@ -765,6 +774,7 @@ mod tests {
                     timeouts: maki_providers::Timeouts::default(),
                     file_tracker: FileReadTracker::fresh(),
                     prompt_slots: Arc::new(crate::prompt::ResolvedSlots::default()),
+                    subagent_semaphore: None,
                 },
                 AgentRunParams {
                     history: &mut history,

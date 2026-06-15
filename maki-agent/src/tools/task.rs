@@ -174,6 +174,7 @@ impl Task {
                 timeouts: ctx.timeouts,
                 file_tracker: FileReadTracker::fresh(),
                 prompt_slots: Arc::clone(&ctx.prompt_slots),
+                subagent_semaphore: ctx.subagent_semaphore.clone(),
             },
             AgentRunParams {
                 history: &mut history,
@@ -186,6 +187,12 @@ impl Task {
         .with_cancel(child_cancel)
         .with_mcp(ctx.mcp.clone());
         let start = Instant::now();
+        let _permit = if let Some(ref semaphore) = ctx.subagent_semaphore {
+            let permit = ctx.cancel.race(semaphore.acquire()).await?;
+            Some(permit)
+        } else {
+            None
+        };
         let result = agent.run(input).await;
         let duration_ms = start.elapsed().as_millis() as u64;
         drop(agent);
@@ -243,6 +250,7 @@ impl super::ToolInvocation for Task {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The audience bitmask decides which agents can call each tool, so flipping a flag is
     /// a behavior change (letting `memory` into the interpreter, say, hands subagents a new
@@ -288,5 +296,116 @@ mod tests {
                 "audience drift for '{name}': expected {want:?}, got {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn semaphore_limits_concurrent_subagents() {
+        smol::block_on(async {
+            const LIMIT: usize = 2;
+            const SPAWN_COUNT: usize = 4;
+            let semaphore = Arc::new(async_lock::Semaphore::new(LIMIT));
+            let max_concurrent = Arc::new(AtomicUsize::new(0));
+            let current = Arc::new(AtomicUsize::new(0));
+            let _cancel = crate::cancel::CancelToken::none();
+
+            let mut handles = Vec::new();
+            for _ in 0..SPAWN_COUNT {
+                let sem = Arc::clone(&semaphore);
+                let max = Arc::clone(&max_concurrent);
+                let cur = Arc::clone(&current);
+                handles.push(smol::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    let active = cur.fetch_add(1, Ordering::AcqRel) + 1;
+                    max.fetch_max(active, Ordering::Release);
+                    smol::Timer::after(std::time::Duration::from_millis(50)).await;
+                    cur.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            let observed = max_concurrent.load(Ordering::Acquire);
+            assert!(
+                observed <= LIMIT,
+                "max concurrent {observed} exceeds limit {LIMIT}"
+            );
+        });
+    }
+
+    #[test]
+    fn no_semaphore_allows_unlimited_concurrency() {
+        smol::block_on(async {
+            const SPAWN_COUNT: usize = 5;
+            let max_concurrent = Arc::new(AtomicUsize::new(0));
+            let current = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..SPAWN_COUNT {
+                let max = Arc::clone(&max_concurrent);
+                let cur = Arc::clone(&current);
+                handles.push(smol::spawn(async move {
+                    let active = cur.fetch_add(1, Ordering::AcqRel) + 1;
+                    max.fetch_max(active, Ordering::Release);
+                    smol::Timer::after(std::time::Duration::from_millis(50)).await;
+                    cur.fetch_sub(1, Ordering::AcqRel);
+                }));
+            }
+
+            for h in handles {
+                h.await;
+            }
+
+            let observed = max_concurrent.load(Ordering::Acquire);
+            assert_eq!(
+                observed, SPAWN_COUNT,
+                "expected all {SPAWN_COUNT} concurrent without semaphore"
+            );
+        });
+    }
+
+    #[test]
+    fn cancellation_while_waiting_for_permit() {
+        smol::block_on(async {
+            let semaphore = Arc::new(async_lock::Semaphore::new(1));
+            let _held = semaphore.acquire().await;
+
+            let (trigger, cancel) = crate::cancel::CancelToken::new();
+            let sem = Arc::clone(&semaphore);
+
+            let waiter = smol::spawn(async move {
+                let (tx, rx) = flume::bounded::<()>(1);
+                let sem_for_task = Arc::clone(&sem);
+                smol::spawn(async move {
+                    let _permit = sem_for_task.acquire().await;
+                    let _ = tx.send(());
+                })
+                .detach();
+
+                futures_lite::future::race(
+                    async {
+                        rx.recv_async()
+                            .await
+                            .map_err(|_| "disconnected".to_string())
+                    },
+                    async {
+                        cancel.cancelled().await;
+                        Err("cancelled".to_string())
+                    },
+                )
+                .await
+            });
+
+            trigger.cancel();
+            smol::Timer::after(std::time::Duration::from_millis(20)).await;
+            drop(_held);
+
+            let result = waiter.await;
+            assert!(
+                result.is_err(),
+                "expected cancellation error, got: {result:?}"
+            );
+        });
     }
 }
