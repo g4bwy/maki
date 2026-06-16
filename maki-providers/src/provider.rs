@@ -211,6 +211,20 @@ impl ProviderKind {
         }
     }
 
+    pub fn create_with_config(
+        self,
+        config: &maki_config::Config,
+        timeouts: Timeouts,
+    ) -> Result<Box<dyn Provider>, AgentError> {
+        match self {
+            Self::LlamaCpp => Ok(Box::new(LlamaCpp::from_config(
+                &config.llama_cpp,
+                timeouts,
+            )?)),
+            _ => self.create(timeouts),
+        }
+    }
+
     pub fn is_available(self) -> bool {
         self.create(Timeouts::default()).is_ok()
     }
@@ -247,12 +261,20 @@ pub trait Provider: Send + Sync {
 }
 
 pub fn from_model(model: &Model, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
+    from_model_with_config(model, timeouts, &maki_config::Config::default())
+}
+
+pub fn from_model_with_config(
+    model: &Model,
+    timeouts: Timeouts,
+    config: &maki_config::Config,
+) -> Result<Box<dyn Provider>, AgentError> {
     if let Some(slug) = &model.dynamic_slug {
         let provider = dynamic::create(slug, timeouts)?;
         debug!(slug, model = %model.id, "dynamic provider created");
         return Ok(provider);
     }
-    let provider = model.provider.create(timeouts)?;
+    let provider = model.provider.create_with_config(config, timeouts)?;
     debug!(provider = %model.provider, model = %model.id, "provider created");
     Ok(provider)
 }
@@ -261,14 +283,23 @@ pub async fn from_model_async(
     model: &Model,
     timeouts: Timeouts,
 ) -> Result<Box<dyn Provider>, AgentError> {
+    from_model_async_with_config(model, timeouts, &maki_config::Config::default()).await
+}
+
+pub async fn from_model_async_with_config(
+    model: &Model,
+    timeouts: Timeouts,
+    config: &maki_config::Config,
+) -> Result<Box<dyn Provider>, AgentError> {
     let slug = model.dynamic_slug.clone();
     let kind = model.provider;
     let id = model.id.clone();
+    let config = config.clone();
     let provider = smol::unblock(move || {
         if let Some(slug) = &slug {
             dynamic::create(slug, timeouts)
         } else {
-            kind.create(timeouts)
+            kind.create_with_config(&config, timeouts)
         }
     })
     .await?;

@@ -200,6 +200,8 @@ pub struct RawConfig {
     pub storage: StorageFileConfig,
     pub index: IndexFileConfig,
     pub tools: HashMap<String, ToolFileConfig>,
+    #[serde(default)]
+    pub llama_cpp: LlamaCppFileConfig,
 }
 
 impl RawConfig {
@@ -211,6 +213,7 @@ impl RawConfig {
         self.storage.merge(overlay.storage);
         self.index.merge(overlay.index);
         self.tools.extend(overlay.tools);
+        self.llama_cpp.merge(overlay.llama_cpp);
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
@@ -233,6 +236,7 @@ impl RawConfig {
             storage: StorageConfig::from_file(self.storage),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_tools(self.tools),
+            llama_cpp: LlamaCppConfig::from_file(self.llama_cpp),
         })
     }
 }
@@ -381,6 +385,129 @@ impl StorageFileConfig {
     }
 }
 
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlamaCppServerFileConfig {
+    pub url: Option<String>,
+    pub api_key: Option<String>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlamaCppFileConfig {
+    pub servers: Vec<LlamaCppServerFileConfig>,
+    pub thinking_budgets: HashMap<String, u32>,
+    #[serde(default = "default_auto_load")]
+    pub auto_load: bool,
+}
+
+fn default_auto_load() -> bool {
+    true
+}
+
+impl LlamaCppFileConfig {
+    fn merge(&mut self, overlay: LlamaCppFileConfig) {
+        if !overlay.servers.is_empty() {
+            self.servers = overlay.servers;
+        }
+        if !overlay.thinking_budgets.is_empty() {
+            self.thinking_budgets.extend(overlay.thinking_budgets);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LlamaCppServerConfig {
+    pub url: String,
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinkingBudgets {
+    pub minimal: u32,
+    pub low: u32,
+    pub medium: u32,
+    pub high: u32,
+}
+
+impl Default for ThinkingBudgets {
+    fn default() -> Self {
+        Self {
+            minimal: 1024,
+            low: 2048,
+            medium: 8192,
+            high: 16384,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LlamaCppConfig {
+    pub servers: Vec<LlamaCppServerConfig>,
+    pub thinking_budgets: ThinkingBudgets,
+    pub auto_load: bool,
+}
+
+impl Default for LlamaCppConfig {
+    fn default() -> Self {
+        Self::from_file(LlamaCppFileConfig::default())
+    }
+}
+
+impl LlamaCppConfig {
+    fn from_file(f: LlamaCppFileConfig) -> Self {
+        let thinking_budgets = ThinkingBudgets {
+            minimal: f.thinking_budgets.get("minimal").copied().unwrap_or(1024),
+            low: f.thinking_budgets.get("low").copied().unwrap_or(2048),
+            medium: f.thinking_budgets.get("medium").copied().unwrap_or(8192),
+            high: f.thinking_budgets.get("high").copied().unwrap_or(16384),
+        };
+        let servers = f
+            .servers
+            .into_iter()
+            .filter_map(|s| {
+                let raw_url = s.url?;
+                let url = raw_url.strip_suffix('/').unwrap_or(&raw_url).to_string();
+                if url.is_empty() {
+                    return None;
+                }
+                Some(LlamaCppServerConfig {
+                    url,
+                    api_key: s.api_key,
+                })
+            })
+            .collect();
+        Self {
+            servers,
+            thinking_budgets,
+            auto_load: f.auto_load,
+        }
+    }
+
+    /// Resolve the list of servers with fallback chain:
+    /// config servers > LLAMA_SERVER_URL > LLAMA_CPP_HOST > default
+    pub fn resolve_servers(&self) -> Vec<LlamaCppServerConfig> {
+        if !self.servers.is_empty() {
+            return self.servers.clone();
+        }
+        // Fallback to env vars
+        let from_env = std::env::var("LLAMA_SERVER_URL")
+            .ok()
+            .or_else(|| std::env::var("LLAMA_CPP_HOST").ok());
+        if let Some(url) = from_env {
+            let url = url.strip_suffix('/').unwrap_or(&url).to_string();
+            if !url.is_empty() {
+                return vec![LlamaCppServerConfig { url, api_key: None }];
+            }
+        }
+        // Default
+        vec![LlamaCppServerConfig {
+            url: "http://127.0.0.1:8080".to_string(),
+            api_key: None,
+        }]
+    }
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndexFileConfig {
@@ -454,6 +581,7 @@ pub struct PermissionsConfig {
     pub rules: Vec<PermissionRule>,
 }
 
+#[derive(Clone, Default)]
 pub struct Config {
     pub always_yolo: bool,
     pub always_fast: bool,
@@ -464,6 +592,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
+    pub llama_cpp: LlamaCppConfig,
 }
 
 #[derive(Debug, Clone, Copy, ConfigSection)]
@@ -1281,6 +1410,7 @@ mod tests {
             storage: StorageConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
+            llama_cpp: LlamaCppConfig::default(),
         };
         match (section, field) {
             ("provider", "connect_timeout_secs") => {
