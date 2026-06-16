@@ -14,7 +14,7 @@ use maki_agent::{AgentConfig, CancelToken, McpCommand};
 use maki_config::UiConfig;
 use maki_lua::{EventHandle, HintReader, KeymapReader, LuaCommandReader, UiAction};
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::provider::{Provider, fetch_all_models, from_model_with_config};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use tracing::warn;
@@ -40,6 +40,7 @@ pub struct EventLoopParams {
     pub session: AppSession,
     pub storage: StateDir,
     pub config: AgentConfig,
+    pub maki_config: maki_config::Config,
     pub ui_config: UiConfig,
     pub input_history_size: usize,
     pub permissions: Arc<PermissionManager>,
@@ -59,6 +60,7 @@ pub(crate) struct EventLoop<'t> {
     handles: AgentHandles,
     model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
+    maki_config: maki_config::Config,
     permissions: Arc<PermissionManager>,
     shell_tx: flume::Sender<ShellEvent>,
     shell_rx: flume::Receiver<ShellEvent>,
@@ -127,6 +129,7 @@ impl<'t> EventLoop<'t> {
             session,
             storage,
             config,
+            maki_config,
             ui_config,
             input_history_size,
             permissions,
@@ -151,8 +154,9 @@ impl<'t> EventLoop<'t> {
         let initial_history = session.messages.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 
-        let provider: Arc<dyn Provider> =
-            Arc::from(from_model(&model, timeouts).context("create provider")?);
+        let provider: Arc<dyn Provider> = Arc::from(
+            from_model_with_config(&model, timeouts, &maki_config).context("create provider")?,
+        );
         let model_slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
             model: model.clone(),
             provider,
@@ -161,6 +165,7 @@ impl<'t> EventLoop<'t> {
             &model_slot,
             initial_history,
             config.clone(),
+            maki_config.clone(),
             ui_config.tool_output_lines,
             &permissions,
             cwd,
@@ -206,6 +211,7 @@ impl<'t> EventLoop<'t> {
             handles,
             model_slot,
             config,
+            maki_config,
             permissions,
             shell_tx,
             shell_rx,
@@ -383,6 +389,7 @@ impl<'t> EventLoop<'t> {
             history,
             &self.model_slot,
             self.config.clone(),
+            self.maki_config.clone(),
             self.app.ui_config.tool_output_lines,
             &self.permissions,
             &mut self.app,
@@ -417,7 +424,8 @@ impl<'t> EventLoop<'t> {
                 let loaded = *loaded;
                 if loaded.model_spec != self.model_slot.load().model.spec()
                     && let Ok(new_model) = Model::from_spec(&loaded.model_spec)
-                    && let Ok(new_provider) = from_model(&new_model, self.timeouts)
+                    && let Ok(new_provider) =
+                        from_model_with_config(&new_model, self.timeouts, &self.maki_config)
                 {
                     self.model_slot.store(Arc::new(ModelSlot {
                         model: new_model,
@@ -486,16 +494,18 @@ impl<'t> EventLoop<'t> {
 
     fn change_model(&mut self, spec: String) {
         match Model::from_spec(&spec) {
-            Ok(new_model) => match from_model(&new_model, self.timeouts) {
-                Ok(new_provider) => {
-                    self.app.update_model(&new_model);
-                    self.model_slot.store(Arc::new(ModelSlot {
-                        model: new_model,
-                        provider: Arc::from(new_provider),
-                    }));
+            Ok(new_model) => {
+                match from_model_with_config(&new_model, self.timeouts, &self.maki_config) {
+                    Ok(new_provider) => {
+                        self.app.update_model(&new_model);
+                        self.model_slot.store(Arc::new(ModelSlot {
+                            model: new_model,
+                            provider: Arc::from(new_provider),
+                        }));
+                    }
+                    Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
                 }
-                Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
-            },
+            }
             Err(e) => self.app.flash(format!("Invalid model: {e}")),
         }
     }

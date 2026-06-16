@@ -25,6 +25,7 @@ use super::shared_queue::{QueueItem, QueueReceiver};
 pub(super) struct AgentLoop {
     model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
+    maki_config: maki_config::Config,
     tool_output_lines: ToolOutputLines,
     vars: Vars,
     instructions: Instructions,
@@ -50,6 +51,7 @@ impl AgentLoop {
     pub(super) fn new(
         model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
+        maki_config: maki_config::Config,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
         shared_history: Arc<ArcSwap<Vec<Message>>>,
@@ -68,6 +70,7 @@ impl AgentLoop {
         Self {
             model_slot,
             config,
+            maki_config,
             tool_output_lines,
             vars: Vars::default(),
             instructions: Instructions::default(),
@@ -219,6 +222,7 @@ impl AgentLoop {
                 provider: Arc::clone(&slot.provider),
                 model: slot.model.clone(),
                 config: self.config.clone(),
+                maki_config: self.maki_config.clone(),
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
