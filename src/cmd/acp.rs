@@ -58,10 +58,13 @@ pub fn run(model_arg: Option<String>, yolo: bool) -> Result<()> {
         .map(|h| h.collect_prompt_slots())
         .unwrap_or_default();
 
+    let agent_config = config.agent.clone();
+    let permissions_config = config.permissions.clone();
     maki_acp::run(maki_acp::AcpParams {
         model,
-        config: config.agent,
-        permissions_config: config.permissions,
+        config: agent_config,
+        maki_config: config,
+        permissions_config,
         timeouts,
         initial_wd: cwd,
         mcp_handle,

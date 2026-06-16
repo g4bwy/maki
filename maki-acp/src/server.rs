@@ -164,6 +164,7 @@ fn spawn_session(
     headless::spawn_interactive(InteractiveParams {
         model: params.model.clone(),
         config: params.config.clone(),
+        maki_config: params.maki_config.clone(),
         permissions_config: params.permissions_config.clone(),
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&params.prompt_slots),

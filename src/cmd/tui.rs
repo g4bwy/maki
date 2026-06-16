@@ -131,11 +131,14 @@ pub fn run(cli: Cli) -> Result<()> {
             .event_handle()
             .map(|h| h.collect_prompt_slots())
             .unwrap_or_default();
+        let agent_config = config.agent.clone();
+        let permissions_config = config.permissions.clone();
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             model,
-            config: config.agent,
-            permissions_config: config.permissions,
+            config: agent_config,
+            maki_config: config,
+            permissions_config,
             timeouts,
             prompt_slots,
             fast,
@@ -143,13 +146,16 @@ pub fn run(cli: Cli) -> Result<()> {
         .context("run sdk mode")?;
     } else if cli.print {
         let fast = config.always_fast && model.supports_fast();
+        let agent_config = config.agent.clone();
+        let permissions_config = config.permissions.clone();
         crate::print::run(
             &model,
             cli.prompt,
             cli.output_format,
             cli.verbose,
-            config.agent,
-            config.permissions,
+            agent_config,
+            config,
+            permissions_config,
             timeouts,
             plugin_host.event_handle(),
             fast,
@@ -176,17 +182,22 @@ pub fn run(cli: Cli) -> Result<()> {
             Model::from_spec(&session.model).unwrap_or(model)
         };
         let initial_prompt = read_initial_prompt(cli.prompt)?;
+        let agent_config = config.agent.clone();
+        let ui_config = config.ui;
+        let input_history_size = config.storage.input_history_size;
+        let permissions_config = config.permissions.clone();
         let (session_id, exit_code) = maki_ui::run(
             maki_ui::EventLoopParams {
                 model,
                 commands,
                 session,
                 storage,
-                config: config.agent,
-                ui_config: config.ui,
-                input_history_size: config.storage.input_history_size,
+                config: agent_config,
+                maki_config: config,
+                ui_config,
+                input_history_size,
                 permissions: Arc::new(maki_agent::permissions::PermissionManager::new(
-                    config.permissions,
+                    permissions_config,
                     cwd.clone(),
                 )),
                 timeouts,

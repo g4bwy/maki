@@ -14,6 +14,7 @@ use maki_providers::model::Model;
 pub struct AcpParams {
     pub model: Model,
     pub config: AgentConfig,
+    pub maki_config: maki_config::Config,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub initial_wd: PathBuf,

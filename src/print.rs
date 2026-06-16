@@ -124,6 +124,7 @@ pub fn run(
     format: OutputFormat,
     verbose: bool,
     config: AgentConfig,
+    maki_config: maki_config::Config,
     permissions_config: PermissionsConfig,
     timeouts: maki_providers::Timeouts,
     lua_handle: Option<EventHandle>,
@@ -152,6 +153,7 @@ pub fn run(
     let handle = maki_agent::headless::spawn(HeadlessParams {
         model: model.clone(),
         config,
+        maki_config,
         permissions_config,
         timeouts,
         prompt,

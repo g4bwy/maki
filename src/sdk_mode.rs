@@ -430,6 +430,7 @@ pub struct SdkParams {
     pub cli: Cli,
     pub model: Model,
     pub config: AgentConfig,
+    pub maki_config: maki_config::Config,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
@@ -448,6 +449,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         cli,
         model,
         mut config,
+        maki_config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -472,6 +474,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let handle = headless::spawn_interactive(InteractiveParams {
         model,
         config,
+        maki_config,
         permissions_config,
         timeouts,
         prompt_slots: Arc::new(prompt_slots),
