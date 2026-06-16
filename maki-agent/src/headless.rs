@@ -69,6 +69,7 @@ impl SessionStore {
 pub struct HeadlessParams {
     pub model: Model,
     pub config: AgentConfig,
+    pub maki_config: maki_config::Config,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
@@ -155,19 +156,25 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
         let session_id = session_id.clone();
         let mcp_shutdown = params.mcp_handle.clone();
         let working_dir_path = params.initial_wd.clone();
+        let maki_config = params.maki_config;
         async move {
             let event_tx = EventSender::new(raw_tx, 0);
-            let provider: Arc<dyn Provider> =
-                match provider::from_model_async(&params.model, params.timeouts).await {
-                    Ok(p) => Arc::from(p),
-                    Err(e) => {
-                        error!(error = %e, "provider error");
-                        let _ = event_tx.send(AgentEvent::Error {
-                            message: e.user_message(),
-                        });
-                        return;
-                    }
-                };
+            let provider: Arc<dyn Provider> = match provider::from_model_async_with_config(
+                &params.model,
+                params.timeouts,
+                &maki_config,
+            )
+            .await
+            {
+                Ok(p) => Arc::from(p),
+                Err(e) => {
+                    error!(error = %e, "provider error");
+                    let _ = event_tx.send(AgentEvent::Error {
+                        message: e.user_message(),
+                    });
+                    return;
+                }
+            };
             let error_tx = event_tx.clone();
             let mut history = History::new(Vec::new());
             let mut agent = Agent::new(
@@ -175,6 +182,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
                     provider,
                     model: params.model,
                     config: params.config,
+                    maki_config,
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new(
                         params.permissions_config,
@@ -230,6 +238,7 @@ pub fn spawn(params: HeadlessParams) -> HeadlessHandle {
 pub struct InteractiveParams {
     pub model: Model,
     pub config: AgentConfig,
+    pub maki_config: maki_config::Config,
     pub permissions_config: PermissionsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: Arc<ResolvedSlots>,
@@ -292,10 +301,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
 
     let task = smol::spawn({
         let session_id = session_id.clone();
+        let maki_config = params.maki_config;
         async move {
             let mut model = params.model;
             let mut provider: Arc<dyn Provider> =
-                match provider::from_model_async(&model, params.timeouts).await {
+                match provider::from_model_async_with_config(&model, params.timeouts, &maki_config)
+                    .await
+                {
                     Ok(p) => Arc::from(p),
                     Err(e) => {
                         error!(error = %e, "provider error");
@@ -317,7 +329,13 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                 if let Some(new_model) = model_rx.try_iter().last()
                     && new_model.spec() != model.spec()
                 {
-                    match provider::from_model_async(&new_model, params.timeouts).await {
+                    match provider::from_model_async_with_config(
+                        &new_model,
+                        params.timeouts,
+                        &maki_config,
+                    )
+                    .await
+                    {
                         Ok(p) => {
                             provider = Arc::from(p);
                             tools = tool_definitions(
@@ -370,6 +388,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> InteractiveHandle {
                         provider: Arc::clone(&provider),
                         model: model.clone(),
                         config: params.config.clone(),
+                        maki_config: maki_config.clone(),
                         tool_output_lines: ToolOutputLines::default(),
                         permissions: Arc::clone(&permissions),
                         session_id: Some(session_id.clone()),

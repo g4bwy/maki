@@ -32,6 +32,7 @@ pub struct AgentParams {
     pub provider: Arc<dyn Provider>,
     pub model: Model,
     pub config: AgentConfig,
+    pub maki_config: maki_config::Config,
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<String>,
@@ -66,6 +67,7 @@ pub struct Agent<'h> {
     rollback_len: usize,
     mcp: Option<McpHandle>,
     config: AgentConfig,
+    maki_config: maki_config::Config,
     tool_output_lines: ToolOutputLines,
     reauth_attempts: u32,
     permissions: Arc<PermissionManager>,
@@ -82,6 +84,7 @@ impl<'h> Agent<'h> {
             provider: params.provider,
             model: Arc::new(params.model),
             config: params.config,
+            maki_config: params.maki_config,
             tool_output_lines: params.tool_output_lines,
             permissions: params.permissions,
             timeouts: params.timeouts,
@@ -333,6 +336,7 @@ impl<'h> Agent<'h> {
             mcp: self.mcp.clone(),
             deadline: Deadline::None,
             config: self.config.clone(),
+            maki_config: self.maki_config.clone(),
             tool_output_lines: self.tool_output_lines,
             permissions: Arc::clone(&self.permissions),
             timeouts: self.timeouts,
@@ -498,6 +502,7 @@ mod tests {
                 provider: Arc::new(provider),
                 model: default_model(),
                 config: AgentConfig::default(),
+                maki_config: maki_config::Config::default(),
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::new(PermissionManager::new(
                     maki_config::PermissionsConfig {
@@ -753,6 +758,7 @@ mod tests {
                     provider: Arc::new(HangingProvider),
                     model: default_model(),
                     config: AgentConfig::default(),
+                    maki_config: maki_config::Config::default(),
                     tool_output_lines: ToolOutputLines::default(),
                     permissions: Arc::new(PermissionManager::new(
                         maki_config::PermissionsConfig {

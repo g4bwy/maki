@@ -80,9 +80,13 @@ impl Task {
                     )
                     .map_err(|e| e.to_string())?,
                 );
-                let resolved_provider = provider::from_model_async(&resolved_model, ctx.timeouts)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let resolved_provider = provider::from_model_async_with_config(
+                    &resolved_model,
+                    ctx.timeouts,
+                    &ctx.maki_config,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
                 (resolved_model, Arc::from(resolved_provider))
             }
         } else {
@@ -168,6 +172,7 @@ impl Task {
                 provider,
                 model,
                 config: ctx.config.clone(),
+                maki_config: ctx.maki_config.clone(),
                 tool_output_lines: ToolOutputLines::default(),
                 permissions: Arc::clone(&ctx.permissions),
                 session_id: Some(session_id),
