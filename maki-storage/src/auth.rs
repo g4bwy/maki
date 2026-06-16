@@ -118,6 +118,45 @@ pub fn delete_mcp_auth(dir: &StateDir, server_name: &str) -> Result<bool, Storag
     delete_auth(&auth_path(dir, &format!("mcp-{server_name}")))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LlamaCppApiKey {
+    pub server_url: String,
+    pub api_key: String,
+}
+
+pub fn load_llama_cpp_keys(dir: &StateDir) -> Vec<LlamaCppApiKey> {
+    let path = auth_path(dir, "llama-cpp-keys");
+    load_auth(&path).unwrap_or_default()
+}
+
+pub fn save_llama_cpp_key(dir: &StateDir, url: &str, key: &str) -> Result<(), StorageError> {
+    let path = auth_path(dir, "llama-cpp-keys");
+    let mut keys: Vec<LlamaCppApiKey> = load_auth(&path).unwrap_or_default();
+    keys.retain(|k| k.server_url != url);
+    keys.push(LlamaCppApiKey {
+        server_url: url.to_owned(),
+        api_key: key.to_owned(),
+    });
+    save_auth(&path, &keys)
+}
+
+pub fn delete_llama_cpp_key(dir: &StateDir, url: &str) -> Result<bool, StorageError> {
+    let path = auth_path(dir, "llama-cpp-keys");
+    let mut keys: Vec<LlamaCppApiKey> = load_auth(&path).unwrap_or_default();
+    let len_before = keys.len();
+    keys.retain(|k| k.server_url != url);
+    if keys.len() < len_before {
+        if keys.is_empty() {
+            delete_auth(&path)?;
+        } else {
+            save_auth(&path, &keys)?;
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +256,43 @@ mod tests {
         let dir = StateDir::from_path(tmp.path().to_path_buf());
         save_mcp_auth(&dir, "srv", &data).unwrap();
         assert!(load_mcp_auth(&dir, "srv", lookup_url).is_none());
+    }
+
+    #[test]
+    fn llama_cpp_key_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        assert!(load_llama_cpp_keys(&dir).is_empty());
+
+        save_llama_cpp_key(&dir, "http://localhost:8080", "key-1").unwrap();
+        let keys = load_llama_cpp_keys(&dir);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].server_url, "http://localhost:8080");
+        assert_eq!(keys[0].api_key, "key-1");
+
+        save_llama_cpp_key(&dir, "http://localhost:8081", "key-2").unwrap();
+        let keys = load_llama_cpp_keys(&dir);
+        assert_eq!(keys.len(), 2);
+
+        assert!(delete_llama_cpp_key(&dir, "http://localhost:8080").unwrap());
+        let keys = load_llama_cpp_keys(&dir);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].server_url, "http://localhost:8081");
+
+        assert!(!delete_llama_cpp_key(&dir, "http://nonexistent").unwrap());
+
+        assert!(delete_llama_cpp_key(&dir, "http://localhost:8081").unwrap());
+        assert!(load_llama_cpp_keys(&dir).is_empty());
+    }
+
+    #[test]
+    fn llama_cpp_key_update_overwrites() {
+        let tmp = TempDir::new().unwrap();
+        let dir = StateDir::from_path(tmp.path().to_path_buf());
+        save_llama_cpp_key(&dir, "http://localhost:8080", "old-key").unwrap();
+        save_llama_cpp_key(&dir, "http://localhost:8080", "new-key").unwrap();
+        let keys = load_llama_cpp_keys(&dir);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].api_key, "new-key");
     }
 }
