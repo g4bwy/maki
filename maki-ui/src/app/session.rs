@@ -152,7 +152,8 @@ impl App {
         let theme_gen = crate::theme::generation();
         for mut item in items {
             item.theme_gen = Some(theme_gen);
-            eh.request_restore(item, tx.clone());
+            eh.request_restore(item.clone(), tx.clone());
+            eh.store_click_handler(item.tool_use_id.clone(), item);
         }
     }
 

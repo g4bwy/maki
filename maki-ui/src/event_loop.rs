@@ -447,6 +447,7 @@ impl<'t> EventLoop<'t> {
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::SendMessage(input) => {
+                self.app.prune_click_handlers();
                 let mut input = *input;
                 input.preamble = self.app.shell.drain_results();
                 let run_id = self.app.run_id;

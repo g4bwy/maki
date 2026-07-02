@@ -227,80 +227,141 @@ impl MessagesPanel {
         {
             self.store_snapshot(&event.id, BufferSnapshot::from_arc(lines), false, None);
         }
-        let Some(msg) = self
+        let Some(msg_idx) = self
             .messages
-            .iter_mut()
-            .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
+            .iter()
+            .rposition(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == event.id))
         else {
             return;
         };
-        if let DisplayRole::Tool(t) = &mut msg.role {
-            t.status = if event.is_error {
-                ToolStatus::Error
-            } else {
-                ToolStatus::Success
-            };
-        }
-        truncate_to_header(&mut msg.text);
-        let hints = self.render_hints.get(&event.tool);
-        let done_annotation = event
-            .annotation
-            .as_deref()
-            .map(str::to_owned)
-            .or_else(|| tool_output_annotation(&event.output));
-        if let Some(suffix) = &done_annotation {
-            append_annotation(&mut msg.annotation, suffix);
-        }
-
-        match &event.output {
-            ToolOutput::Plain(text) | ToolOutput::Markdown(text) | ToolOutput::ReadDir(text)
-                if msg.render_snapshot.is_none() =>
-            {
-                let limits = output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
-                let tr = truncate_output(&text.text, limits.max_lines, limits.keep);
-                msg.truncated_lines = tr.skipped;
-                if !tr.kept.is_empty() {
-                    msg.text = format!("{}\n{}", msg.text, tr.kept);
-                }
-            }
-            ToolOutput::GrepResult { entries } if entries.is_empty() => {
-                msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
-            }
-            ToolOutput::Batch { entries, .. } => {
-                let failed = entries
-                    .iter()
-                    .filter(|e| e.status == BatchToolStatus::Error)
-                    .count();
-                if failed > 0 {
-                    let total = entries.len();
-                    msg.text = format!("{}/{total} tools succeeded", total - failed);
-                }
-            }
-            _ => {}
-        }
-        if let ToolOutput::Batch {
-            entries: new_entries,
-            text,
-        } = &event.output
-            && let Some(arc) = &mut msg.tool_output
-            && let ToolOutput::Batch {
-                entries: existing,
-                text: existing_text,
-            } = Arc::make_mut(arc)
+        let is_error = event.is_error;
         {
-            for (existing, new) in existing.iter_mut().zip(new_entries) {
-                existing.status = new.status;
-                existing.output = new.output.clone();
-                if new.raw_input.is_some() {
-                    existing.raw_input = new.raw_input.clone();
-                }
+            let msg = &mut self.messages[msg_idx];
+            if let DisplayRole::Tool(t) = &mut msg.role {
+                t.status = if is_error {
+                    ToolStatus::Error
+                } else {
+                    ToolStatus::Success
+                };
             }
-            *existing_text = text.clone();
-        } else {
-            msg.tool_output = Some(Arc::new(event.output));
+            truncate_to_header(&mut msg.text);
+            let hints = self.render_hints.get(&event.tool);
+            let done_annotation = event
+                .annotation
+                .as_deref()
+                .map(str::to_owned)
+                .or_else(|| tool_output_annotation(&event.output));
+            if let Some(suffix) = &done_annotation {
+                append_annotation(&mut msg.annotation, suffix);
+            }
+
+            match &event.output {
+                ToolOutput::Plain(text)
+                | ToolOutput::Markdown(text)
+                | ToolOutput::ReadDir(text)
+                    if msg.render_snapshot.is_none() =>
+                {
+                    let limits =
+                        output_limits_from_hints(&event.tool, hints, &self.tool_output_lines);
+                    let tr = truncate_output(&text.text, limits.max_lines, limits.keep);
+                    msg.truncated_lines = tr.skipped;
+                    if !tr.kept.is_empty() {
+                        msg.text = format!("{}\n{}", msg.text, tr.kept);
+                    }
+                }
+                ToolOutput::GrepResult { entries } if entries.is_empty() => {
+                    msg.text = format!("{}\n{NO_FILES_FOUND}", msg.text);
+                }
+                ToolOutput::Batch { entries, .. } => {
+                    let failed = entries
+                        .iter()
+                        .filter(|e| e.status == BatchToolStatus::Error)
+                        .count();
+                    if failed > 0 {
+                        let total = entries.len();
+                        msg.text = format!("{}/{total} tools succeeded", total - failed);
+                    }
+                }
+                _ => {}
+            }
+            if let ToolOutput::Batch {
+                entries: new_entries,
+                text,
+            } = &event.output
+                && let Some(arc) = &mut msg.tool_output
+                && let ToolOutput::Batch {
+                    entries: existing,
+                    text: existing_text,
+                } = Arc::make_mut(arc)
+            {
+                for (existing, new) in existing.iter_mut().zip(new_entries) {
+                    existing.status = new.status;
+                    existing.output = new.output.clone();
+                    if new.raw_input.is_some() {
+                        existing.raw_input = new.raw_input.clone();
+                    }
+                }
+                *existing_text = text.clone();
+            } else {
+                msg.tool_output = Some(Arc::new(event.output));
+            }
+            msg.live_output = None;
         }
-        msg.live_output = None;
         self.rebuild_tool_segment(&event.id);
+        self.store_click_handler_for(&event.id, &event.tool, is_error);
+    }
+
+    fn store_click_handler_for(&self, tool_id: &str, tool_name: &str, is_error: bool) {
+        let (Some(handle), Some(msg)) = (
+            &self.lua_event_handle,
+            self.messages
+                .iter()
+                .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id)),
+        ) else {
+            return;
+        };
+        let Some(input) = msg.tool_raw_input.as_deref() else {
+            return;
+        };
+        let Some(output) = msg.tool_output.as_ref() else {
+            return;
+        };
+        let output_text = output.as_text();
+        handle.store_click_handler(
+            tool_id.to_owned(),
+            maki_lua::RestoreItem {
+                tool: Arc::from(tool_name),
+                tool_use_id: tool_id.to_owned(),
+                output: output_text,
+                input: input.clone(),
+                is_error,
+                tool_output_lines: self.tool_output_lines,
+                theme_gen: None,
+            },
+        );
+        if let ToolOutput::Batch { entries, .. } = output.as_ref() {
+            for (idx, entry) in entries.iter().enumerate() {
+                let child_id = format!("{tool_id}__{idx}");
+                let Some(raw_input) = &entry.raw_input else {
+                    continue;
+                };
+                let Some(entry_output) = &entry.output else {
+                    continue;
+                };
+                handle.store_click_handler(
+                    child_id.clone(),
+                    maki_lua::RestoreItem {
+                        tool: Arc::from(entry.tool.as_str()),
+                        tool_use_id: child_id,
+                        output: entry_output.as_text(),
+                        input: raw_input.clone(),
+                        is_error: entry.status == BatchToolStatus::Error,
+                        tool_output_lines: self.tool_output_lines,
+                        theme_gen: None,
+                    },
+                );
+            }
+        }
     }
 
     pub fn batch_progress(
@@ -514,6 +575,16 @@ impl MessagesPanel {
                 |m| matches!(&m.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress),
             )
             .count()
+    }
+
+    pub fn collected_tool_ids(&self) -> std::collections::HashSet<Arc<str>> {
+        let mut ids = std::collections::HashSet::new();
+        for msg in &self.messages {
+            if let DisplayRole::Tool(t) = &msg.role {
+                ids.insert(Arc::from(t.id.as_str()));
+            }
+        }
+        ids
     }
 
     #[cfg(test)]

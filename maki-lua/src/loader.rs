@@ -14,6 +14,7 @@ use crate::error::PluginError;
 use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
 use crate::runtime::{self, ClickReply, LuaThread, Request, RestoreItem};
 use maki_agent::prompt::ResolvedSlots;
+use std::collections::HashSet;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -349,7 +350,13 @@ impl EventHandle {
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
-        let _ = self.tx.send(Request::RestoreToolAsync { item, event_tx });
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        let _ = self.tx.send(Request::RestoreToolAsync {
+            item,
+            event_tx,
+            reply: reply_tx,
+        });
+        let _ = reply_rx.recv();
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
@@ -365,6 +372,20 @@ impl EventHandle {
 
     pub fn run_keybind_callback(&self, id: u64) {
         let _ = self.tx.try_send(Request::RunKeybindCallback { id });
+    }
+
+    pub fn prune_click_handlers(&self, keep: HashSet<Arc<str>>) -> usize {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self
+            .tx
+            .send(Request::PruneClickHandlers { keep, reply: tx });
+        rx.recv().unwrap_or(0)
+    }
+
+    pub fn store_click_handler(&self, tool_use_id: String, item: RestoreItem) {
+        let _ = self
+            .tx
+            .send(Request::StoreClickHandler { tool_use_id, item });
     }
 }
 

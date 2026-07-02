@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,6 +124,7 @@ pub enum Request {
     RestoreToolAsync {
         item: RestoreItem,
         event_tx: maki_agent::EventSender,
+        reply: flume::Sender<()>,
     },
     RestoreComplete {
         flag: Arc<AtomicBool>,
@@ -135,10 +136,19 @@ pub enum Request {
     RunKeybindCallback {
         id: u64,
     },
+    PruneClickHandlers {
+        keep: HashSet<Arc<str>>,
+        reply: flume::Sender<usize>,
+    },
+    StoreClickHandler {
+        tool_use_id: String,
+        item: RestoreItem,
+    },
 }
 
 /// Everything needed to re-run a lua restore callback. Used by session
 /// restore and theme re-bake so both paths share a single struct.
+#[derive(Clone)]
 pub struct RestoreItem {
     pub tool: Arc<str>,
     pub tool_use_id: String,
@@ -216,7 +226,7 @@ impl TaskCell {
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
 
-type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
+type ClickHandlerMap = HashMap<String, RestoreItem>;
 
 pub(crate) fn lock_cell(handle: &TaskHandle) -> std::sync::MutexGuard<'_, TaskCell> {
     handle.lock().unwrap_or_else(|e| e.into_inner())
@@ -377,13 +387,7 @@ pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R
     f(&mut lock_cell(&active_task(lua)).bufs)
 }
 
-pub(crate) fn with_click_handlers<R>(
-    lua: &Lua,
-    f: impl FnOnce(&mut ClickHandlerMap) -> R,
-) -> Option<R> {
-    lua.app_data_mut::<ClickHandlerMap>().map(|mut m| f(&mut m))
-}
-
+#[cfg(test)]
 pub(crate) fn with_live_ctx<R>(lua: &Lua, f: impl FnOnce(&LiveCtx) -> R) -> Option<R> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     lock_cell(&handle).live.as_ref().map(f)
@@ -1623,36 +1627,67 @@ pub fn spawn(
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
-                        Request::FireBufClick { tool_id, row, reply } => {
-                            let entry =
-                                rt.lua.app_data_ref::<ClickHandlerMap>().and_then(|m| {
-                                    let (key, buf) = m.get(&tool_id)?;
-                                    let func = rt.lua.registry_value::<Function>(key).ok()?;
-                                    Some((func, Arc::clone(buf)))
-                                });
-                            if let Some((func, buf)) = entry {
-                                let lua = rt.lua.clone();
-                                let ex_ref = Rc::clone(&ex);
-                                let g = Rc::clone(&gate);
-                                ex.spawn(async move {
-                                    let Ok(data) = lua.create_table() else {
-                                        let _ = reply.send(None);
-                                        return;
-                                    };
-                                    let _ = data.set("row", row);
-                                    if let Err(e) = run_detached(&lua, func.call_async::<()>(data)).await {
-                                        tracing::warn!(tool_id, error = %e, "click handler failed");
-                                    }
-                                    drain_spawn_queue(&lua, &ex_ref, &g);
-                                    let _ = reply.send(Some(ClickReply {
-                                        snapshot: buf.take(),
-                                        live_buf: buf,
-                                    }));
-                                })
-                                .detach();
-                            } else {
+                        Request::FireBufClick { tool_id, row: _row, reply } => {
+                            let item = rt.lua.app_data_ref::<ClickHandlerMap>()
+                                .and_then(|m| m.get(&tool_id).cloned());
+                            let Some(item) = item else {
                                 let _ = reply.send(None);
-                            }
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let ex_ref = Rc::clone(&ex);
+                            let g = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let scope = TaskScope::detached(&lua);
+                                let run = scope.scope_future(async {
+                                    let (func, _plugin_name) = {
+                                        let plugins_ref = plugins.borrow();
+                                        let (pname, tk) = plugins_ref
+                                            .iter()
+                                            .find_map(|(pname, tools)| tools.get(&*item.tool).map(|tk| (pname.clone(), tk)))?;
+                                        let key = tk.restore.as_ref()?;
+                                        (lua.registry_value::<Function>(key).ok()?, pname)
+                                    };
+                                    let input_lua = json_to_lua(&lua, &item.input).ok()?;
+                                    let thread = lua.create_thread(func).ok()?;
+                                    let (dummy_tx, _) = flume::unbounded();
+                                    let cell = TaskCell::new(
+                                        CancelToken::none(),
+                                        None,
+                                        Some(LiveCtx {
+                                            event_tx: maki_agent::EventSender::new(dummy_tx, 0),
+                                            tool_use_id: item.tool_use_id.clone(),
+                                        }),
+                                    );
+                                    let ctx_ud = lua.create_userdata(crate::api::util::ctx::RestoreCtx {
+                                        tool_output_lines: item.tool_output_lines,
+                                    }).ok()?;
+                                    let inner = thread
+                                        .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx_ud))
+                                        .ok()?;
+                                    let inner_scope = TaskScope::new(&lua, cell);
+                                    let ret = inner_scope.scope_future(inner).await.ok()?;
+                                    drop(inner_scope);
+                                    let reply_body = extract_restore_reply(&ret)?;
+                                    if reply_body.header.is_none() {
+                                        // Compute header if not provided by restore callback
+                                    }
+                                    let snapshot = reply_body.body.unwrap_or_else(|| {
+                                        BufferSnapshot::plain_text("(empty)".into())
+                                    });
+                                    let live_buf = Arc::new(SharedBuf::new());
+                                    if !snapshot.lines.is_empty() {
+                                        live_buf.set_lines(snapshot.lines.as_ref().clone());
+                                    }
+                                    Some(ClickReply { snapshot, live_buf })
+                                });
+                                let result = run.await;
+                                drop(scope);
+                                drain_spawn_queue(&lua, &ex_ref, &g);
+                                let _ = reply.send(result);
+                            })
+                            .detach();
                         }
                         Request::RunCommand {
                             plugin,
@@ -1713,14 +1748,15 @@ pub fn spawn(
                             let slots = rt.collect_prompt_slots().await;
                             let _ = reply.send(slots);
                         }
-                        Request::RestoreToolAsync { item, event_tx } => {
+                        Request::RestoreToolAsync { item, event_tx, reply } => {
                             let id = item.tool_use_id.clone();
                             let theme_gen = item.theme_gen;
                             let res = rt.restore_item(item).await;
                             drain_spawn_queue(&rt.lua, &ex, &gate);
-                            if let Some(reply) = res {
-                                reply.emit(&id, theme_gen, &event_tx);
+                            if let Some(reply_body) = res {
+                                reply_body.emit(&id, theme_gen, &event_tx);
                             }
+                            let _ = reply.send(());
                         }
                         Request::RestoreComplete { flag } => {
                             flag.store(false, Ordering::Relaxed);
@@ -1783,6 +1819,21 @@ pub fn spawn(
                                 }).detach();
                             }
                         }
+                        Request::PruneClickHandlers { keep, reply } => {
+                            let pruned = rt.lua.app_data_mut::<ClickHandlerMap>()
+                                .map(|mut map| {
+                                    let count = map.len().saturating_sub(keep.len());
+                                    map.retain(|_, item| keep.contains(item.tool_use_id.as_str()));
+                                    count
+                                })
+                                .unwrap_or(0);
+                            let _ = reply.send(pruned);
+                        }
+                        Request::StoreClickHandler { tool_use_id, item } => {
+                            if let Some(mut map) = rt.lua.app_data_mut::<ClickHandlerMap>() {
+                                map.insert(tool_use_id, item);
+                            }
+                        }
                     }
                 }
             }));
@@ -1806,21 +1857,6 @@ pub fn spawn(
         hint_reader,
         ui_action_rx,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn install_live_ctx(lua: &Lua, tool_use_id: &str) {
-    let (tx, _rx) = flume::unbounded();
-    let cell = TaskCell::new(
-        CancelToken::none(),
-        None,
-        Some(LiveCtx {
-            event_tx: maki_agent::EventSender::new(tx, 0),
-            tool_use_id: tool_use_id.to_owned(),
-        }),
-    );
-    let handle: TaskHandle = Arc::new(Mutex::new(cell));
-    lua.set_app_data::<TaskHandle>(handle);
 }
 
 #[cfg(test)]

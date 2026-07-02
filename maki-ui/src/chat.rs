@@ -266,6 +266,10 @@ impl Chat {
         self.messages_panel.register_live_buf(id, buf);
     }
 
+    pub fn collected_tool_ids(&self) -> std::collections::HashSet<Arc<str>> {
+        self.messages_panel.collected_tool_ids()
+    }
+
     pub fn stream_reset(&mut self) {
         self.messages_panel.stream_reset();
     }
@@ -437,6 +441,25 @@ pub fn history_to_display(
                                 tool_output_lines: *tool_output_lines,
                                 theme_gen: None,
                             });
+                            if let Some(ToolOutput::Batch { entries, .. }) = tool_output.as_deref()
+                            {
+                                for (idx, entry) in entries.iter().enumerate() {
+                                    let child_id = format!("{id}__{idx}");
+                                    if let (Some(raw_input), Some(entry_output)) =
+                                        (&entry.raw_input, &entry.output)
+                                    {
+                                        restore_items.push(maki_lua::RestoreItem {
+                                            tool: Arc::from(entry.tool.as_str()),
+                                            tool_use_id: child_id,
+                                            output: entry_output.as_text(),
+                                            input: raw_input.clone(),
+                                            is_error: entry.status == BatchToolStatus::Error,
+                                            tool_output_lines: *tool_output_lines,
+                                            theme_gen: None,
+                                        });
+                                    }
+                                }
+                            }
                             display.push(DisplayMessage {
                                 role: DisplayRole::Tool(Box::new(ToolRole {
                                     id: id.clone(),

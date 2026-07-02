@@ -266,6 +266,19 @@ impl App {
         &mut self.chats[0]
     }
 
+    pub(crate) fn prune_click_handlers(&mut self) {
+        let mut keep = std::collections::HashSet::new();
+        for chat in &self.chats {
+            keep.extend(chat.collected_tool_ids());
+        }
+        if let Some(handle) = &self.lua_event_handle {
+            let pruned = handle.prune_click_handlers(keep);
+            if pruned > 0 {
+                tracing::info!(pruned, "pruned click handlers");
+            }
+        }
+    }
+
     fn is_main_chat(&self) -> bool {
         self.active_chat == 0
     }
