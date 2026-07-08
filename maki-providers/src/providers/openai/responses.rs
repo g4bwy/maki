@@ -28,6 +28,7 @@ pub(crate) fn build_body(
         "input": input,
         "stream": true,
         "store": false,
+        "return_progress": true,
     });
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
@@ -304,6 +305,25 @@ pub(crate) async fn parse_sse(
                     {
                         acc.arguments.push_str(delta);
                     }
+                }
+            }
+
+            "response.in_progress" => {
+                let parsed: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(pp) = parsed.get("prompt_progress") {
+                    let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
+                    let total = pp["total"].as_u64().unwrap_or(0) as u32;
+                    let cache = pp["cache"].as_u64().unwrap_or(0) as u32;
+                    event_tx
+                        .send_async(ProviderEvent::PromptProgress {
+                            processed,
+                            total,
+                            cache,
+                        })
+                        .await?;
                 }
             }
 
@@ -693,5 +713,47 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"ou
             assert_eq!(tools[0].1, "bash");
             assert_eq!(*tools[0].2, Value::Object(Default::default()));
         })
+    }
+
+    #[test]
+    fn parse_sse_prompt_progress_events() {
+        smol::block_on(async {
+            let sse = "\
+event: response.in_progress\n\
+data: {\"prompt_progress\":{\"processed\":100,\"total\":1000,\"cache\":50}}\n\
+\n\
+event: response.in_progress\n\
+data: {\"prompt_progress\":{\"processed\":500,\"total\":1000,\"cache\":50}}\n\
+\n\
+event: response.output_text.delta\n\
+data: {\"delta\":\"Hello\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}}\n\
+\n";
+
+            let (_resp, events) = run_sse(sse).await;
+
+            let progress: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    } => Some((*processed, *total, *cache)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(progress, vec![(100, 1000, 50), (500, 1000, 50)]);
+        })
+    }
+
+    #[test]
+    fn build_body_includes_return_progress() {
+        let model = crate::model::Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let messages = vec![Message::user("hello".to_string())];
+        let body = build_body(&model, &messages, "system", &json!([]));
+        assert_eq!(body["return_progress"], true);
     }
 }
