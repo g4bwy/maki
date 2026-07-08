@@ -180,7 +180,7 @@ impl Provider for OpenAi {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
-                let body = super::responses::build_body(model, messages, system, tools);
+                let body = super::responses::build_body(model, messages, system, tools, false);
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {

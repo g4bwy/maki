@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::components::messages::MessagesPanel;
+use crate::components::messages::{MessagesPanel, PromptProgress};
 use crate::components::tool_display::append_annotation;
 use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
 use crate::markdown::truncate_output;
@@ -77,8 +77,14 @@ impl Chat {
 
     pub fn handle_event(&mut self, event: AgentEvent, plan_path: Option<&Path>) -> ChatEventResult {
         match event {
-            AgentEvent::ThinkingDelta { text } => self.messages_panel.thinking_delta(&text),
-            AgentEvent::TextDelta { text } => self.messages_panel.text_delta(&text),
+            AgentEvent::ThinkingDelta { text } => {
+                self.messages_panel.clear_prompt_progress();
+                self.messages_panel.thinking_delta(&text);
+            }
+            AgentEvent::TextDelta { text } => {
+                self.messages_panel.clear_prompt_progress();
+                self.messages_panel.text_delta(&text);
+            }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => {
@@ -105,6 +111,7 @@ impl Chat {
                 }
             }
             AgentEvent::AutoCompacting => {
+                self.messages_panel.clear_prompt_progress();
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
@@ -116,10 +123,12 @@ impl Chat {
             }
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
+                self.messages_panel.clear_prompt_progress();
                 self.messages_panel.flush();
                 return ChatEventResult::Done;
             }
             AgentEvent::Error { message } => {
+                self.messages_panel.clear_prompt_progress();
                 self.messages_panel.flush();
                 return ChatEventResult::Error(message);
             }
@@ -145,6 +154,7 @@ impl Chat {
                     .tool_header_snapshot(&id, snapshot, theme_gen);
             }
             AgentEvent::Nudge => {
+                self.messages_panel.clear_prompt_progress();
                 self.messages_panel.flush();
                 self.messages_panel.push(DisplayMessage::new(
                     DisplayRole::Assistant,
@@ -154,6 +164,18 @@ impl Chat {
             AgentEvent::SubagentHistory { .. } => {}
             AgentEvent::LiveToolBuf { id, body } => {
                 self.messages_panel.register_live_buf(id, body);
+            }
+            AgentEvent::PromptProgress {
+                processed,
+                total,
+                cache,
+            } => {
+                self.messages_panel
+                    .set_prompt_progress((processed < total).then_some(PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    }));
             }
         }
         ChatEventResult::Continue

@@ -251,7 +251,7 @@ impl Copilot {
         event_tx: &Sender<ProviderEvent>,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
-        let body = responses::build_body(model, messages, system, tools);
+        let body = responses::build_body(model, messages, system, tools, false);
         let resolved = super::ResolvedAuth {
             base_url: Some(auth.endpoint.clone()),
             headers: copilot_headers(&auth, Some("conversation-agent")),

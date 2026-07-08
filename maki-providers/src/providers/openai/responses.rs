@@ -18,6 +18,7 @@ pub(crate) fn build_body(
     messages: &[Message],
     system: &str,
     tools: &Value,
+    include_progress: bool,
 ) -> Value {
     let input = convert_input(messages);
     let wire_tools = convert_tools(tools);
@@ -28,8 +29,10 @@ pub(crate) fn build_body(
         "input": input,
         "stream": true,
         "store": false,
-        "return_progress": true,
     });
+    if include_progress {
+        body["return_progress"] = serde_json::Value::Bool(true);
+    }
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
     }
@@ -750,10 +753,18 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
     }
 
     #[test]
-    fn build_body_includes_return_progress() {
+    fn build_body_includes_return_progress_for_llama_cpp() {
         let model = crate::model::Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let messages = vec![Message::user("hello".to_string())];
-        let body = build_body(&model, &messages, "system", &json!([]));
+        let body = build_body(&model, &messages, "system", &json!([]), true);
         assert_eq!(body["return_progress"], true);
+    }
+
+    #[test]
+    fn build_body_omits_return_progress_for_openai() {
+        let model = crate::model::Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let messages = vec![Message::user("hello".to_string())];
+        let body = build_body(&model, &messages, "system", &json!([]), false);
+        assert!(body.get("return_progress").is_none());
     }
 }
