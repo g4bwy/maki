@@ -1,5 +1,5 @@
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -8,6 +8,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+use maki_config::FilePickerSortOrder;
 use nucleo::pattern::{CaseMatching, Normalization};
 use nucleo::{Config, Matcher, Nucleo, Utf32String};
 use ratatui::Frame;
@@ -68,6 +69,9 @@ struct Session {
     walking: bool,
     matching: bool,
     visible: bool,
+
+    sort_order: FilePickerSortOrder,
+    root: PathBuf,
 }
 
 impl Drop for Session {
@@ -85,7 +89,7 @@ impl FilePickerModal {
         Self { session: None }
     }
 
-    pub fn open(&mut self, cwd: &str) {
+    pub fn open(&mut self, cwd: &str, sort_order: FilePickerSortOrder) {
         self.close();
 
         let notify = Arc::new(|| {});
@@ -96,6 +100,7 @@ impl FilePickerModal {
         let (done_tx, done_rx) = flume::bounded(1);
 
         let root = PathBuf::from(cwd);
+        let root_clone = root.clone();
         if let Err(e) = thread::Builder::new()
             .name("file-walker".into())
             .spawn(move || {
@@ -159,6 +164,8 @@ impl FilePickerModal {
             walking: true,
             matching: false,
             visible: false,
+            sort_order,
+            root: root_clone,
         });
     }
 
@@ -374,6 +381,49 @@ fn refresh_matches(s: &mut Session) {
 
         s.matches.push(Match { path, indices });
     }
+
+    if s.matches.len() > 1 {
+        sort_matches(&mut s.matches, s.sort_order, &s.root);
+    }
+}
+
+fn sort_matches(matches: &mut [Match], sort_order: FilePickerSortOrder, root: &Path) {
+    match sort_order {
+        FilePickerSortOrder::None => {}
+        FilePickerSortOrder::Name => {
+            matches.sort_by_key(|a| a.path.to_lowercase());
+        }
+        FilePickerSortOrder::Mtime => {
+            matches.sort_by(|a, b| {
+                let mtime_a = file_mtime(root, &a.path);
+                let mtime_b = file_mtime(root, &b.path);
+                mtime_b.cmp(&mtime_a).then_with(|| a.path.cmp(&b.path))
+            });
+        }
+        FilePickerSortOrder::Size => {
+            matches.sort_by(|a, b| {
+                let size_a = file_size(root, &a.path);
+                let size_b = file_size(root, &b.path);
+                size_b.cmp(&size_a).then_with(|| a.path.cmp(&b.path))
+            });
+        }
+    }
+}
+
+fn file_mtime(root: &Path, rel_path: &str) -> std::time::SystemTime {
+    root.join(rel_path)
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+}
+
+fn file_size(root: &Path, rel_path: &str) -> u64 {
+    root.join(rel_path)
+        .metadata()
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 fn move_selection(s: &mut Session, delta: isize) {
@@ -554,6 +604,8 @@ mod tests {
             walking: true,
             matching: false,
             visible: false,
+            sort_order: FilePickerSortOrder::None,
+            root: PathBuf::from("/tmp/test-root"),
         });
         (picker, done_tx)
     }

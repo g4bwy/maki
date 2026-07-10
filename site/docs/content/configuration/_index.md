@@ -69,6 +69,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
 | `show_thinking` | bool | `true` | - | When true (default), show full model reasoning live and persisted. When false, hide reasoning behind an indicator (thinking> ...) with a click-to-expand hint, both while thinking and after it completes |
+| `file_picker_sort_order` | FilePickerSortOrder | `none` | - | Sort order for file picker results (none, name, mtime, size) |
 
 ### `ui.tool_output_lines`
 

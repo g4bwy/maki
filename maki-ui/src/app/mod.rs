@@ -753,7 +753,10 @@ impl App {
                 let auto = self.chats[self.active_chat].auto_scroll();
                 self.search_modal.open(top, auto);
             } else if key::FILE_PICKER.matches(key) {
-                self.file_picker.open(&self.state.session.cwd);
+                self.file_picker.open(
+                    &self.state.session.cwd,
+                    self.ui_config.file_picker_sort_order,
+                );
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
             } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
