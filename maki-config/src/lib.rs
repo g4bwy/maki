@@ -93,6 +93,10 @@ pub enum ConfigValue {
     U64(u64),
     Usize(usize),
     OptionalString,
+    Enum {
+        options: &'static [&'static str],
+        default: &'static str,
+    },
 }
 
 impl ConfigValue {
@@ -103,6 +107,7 @@ impl ConfigValue {
             Self::U64(v) => v.to_string(),
             Self::Usize(v) => v.to_string(),
             Self::OptionalString => "none".to_string(),
+            Self::Enum { default, .. } => default.to_string(),
         }
     }
 }
@@ -114,6 +119,7 @@ pub struct ConfigField {
     pub default: ConfigValue,
     pub min: Option<u64>,
     pub description: &'static str,
+    pub enum_options: Option<&'static [&'static str]>,
 }
 
 pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
@@ -123,6 +129,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
+        enum_options: None,
     },
     ConfigField {
         name: "always_fast",
@@ -130,6 +137,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
+        enum_options: None,
     },
     ConfigField {
         name: "always_workflow",
@@ -137,6 +145,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         description: "Start every session with workflow mode (task callable inside code_execution)",
+        enum_options: None,
     },
     ConfigField {
         name: "always_thinking",
@@ -144,6 +153,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         description: "Start every session with extended thinking (true/\"adaptive\", \"off\", or a token budget)",
+        enum_options: None,
     },
 ];
 
@@ -153,6 +163,7 @@ pub const INDEX_FIELDS: &[ConfigField] = &[ConfigField {
     default: ConfigValue::U64(DEFAULT_MAX_FILE_SIZE_MB),
     min: Some(MIN_MAX_FILE_SIZE_MB),
     description: "Max file size for indexing (MB)",
+    enum_options: None,
 }];
 
 #[derive(Debug, Error)]
@@ -280,6 +291,16 @@ pub struct ToolFileConfig {
     pub enabled: Option<bool>,
 }
 
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePickerSortOrder {
+    #[default]
+    None,
+    Name,
+    Mtime,
+    Size,
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiFileConfig {
@@ -289,6 +310,7 @@ pub struct UiFileConfig {
     pub typewriter_ms_per_char: Option<u64>,
     pub mouse_scroll_lines: Option<u32>,
     pub show_thinking: Option<bool>,
+    pub file_picker_sort_order: Option<FilePickerSortOrder>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
 }
 
@@ -302,7 +324,8 @@ impl UiFileConfig {
             flash_duration_ms,
             typewriter_ms_per_char,
             mouse_scroll_lines,
-            show_thinking
+            show_thinking,
+            file_picker_sort_order
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -548,6 +571,13 @@ pub struct UiConfig {
     )]
     pub show_thinking: bool,
 
+    #[config(
+        enum_options = "none,name,mtime,size",
+        default = "FilePickerSortOrder::default()",
+        desc = "Sort order for file picker results (none, name, mtime, size)"
+    )]
+    pub file_picker_sort_order: FilePickerSortOrder,
+
     #[config(skip, default = "ToolOutputLines::default()")]
     pub tool_output_lines: ToolOutputLines,
 }
@@ -568,6 +598,7 @@ impl UiConfig {
             mouse_scroll_lines: f.mouse_scroll_lines.unwrap_or(DEFAULT_MOUSE_SCROLL_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
+            file_picker_sort_order: f.file_picker_sort_order.unwrap_or_default(),
         }
     }
 

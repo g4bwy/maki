@@ -13,12 +13,13 @@ fn write_table_with_min(out: &mut String, fields: &[ConfigField]) {
     for f in fields {
         let default = f.default.format_default();
         let min = f.min.map_or("-".to_string(), |v| v.to_string());
+        let desc = format_desc(f);
         writeln!(
             out,
             "| `{name}` | {ty} | `{default}` | {min} | {desc} |",
             name = f.name,
             ty = escape_pipes(f.ty),
-            desc = f.description,
+            desc = desc,
         )
         .unwrap();
     }
@@ -29,14 +30,27 @@ fn write_table_no_min(out: &mut String, fields: &[ConfigField]) {
     writeln!(out, "|-------|------|---------|-------------|").unwrap();
     for f in fields {
         let default = f.default.format_default();
+        let desc = format_desc(f);
         writeln!(
             out,
             "| `{name}` | {ty} | `{default}` | {desc} |",
             name = f.name,
             ty = escape_pipes(f.ty),
-            desc = f.description,
+            desc = desc,
         )
         .unwrap();
+    }
+}
+
+fn format_desc(f: &ConfigField) -> String {
+    if let Some(options) = f.enum_options {
+        format!(
+            "{desc} ({options})",
+            desc = f.description,
+            options = options.join(", ")
+        )
+    } else {
+        f.description.to_string()
     }
 }
 

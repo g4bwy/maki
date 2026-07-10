@@ -55,6 +55,7 @@ struct FieldAttrs {
     key: Option<String>,
     ty_override: Option<String>,
     val: Option<String>,
+    enum_options: Option<Vec<String>>,
 }
 
 fn parse_struct_attrs(input: &DeriveInput) -> syn::Result<StructAttrs> {
@@ -103,6 +104,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
         key: None,
         ty_override: None,
         val: None,
+        enum_options: None,
     };
 
     for attr in &field.attrs {
@@ -147,6 +149,16 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
                         attrs.val = Some(lit.value());
                     }
                 }
+                "enum_options" => {
+                    if let ConfigAttrValue::Str(lit) = item.value {
+                        let options: Vec<String> = lit
+                            .value()
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .collect();
+                        attrs.enum_options = Some(options);
+                    }
+                }
                 other => {
                     return Err(syn::Error::new(
                         item.key.span(),
@@ -160,26 +172,41 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
     Ok(attrs)
 }
 
-fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
-    match ty_name {
-        "bool" => {
-            let val = default.as_ref().expect("bool field requires default");
-            quote! { ConfigValue::Bool(#val) }
+fn config_value_expr(
+    ty_name: &str,
+    default: &Option<Expr>,
+    enum_options: &Option<Vec<String>>,
+) -> TokenStream2 {
+    if let Some(options) = enum_options {
+        let options_refs: Vec<TokenStream2> = options.iter().map(|s| quote! { #s }).collect();
+        let default_str = options.first().map(|s| s.as_str()).unwrap_or("none");
+        quote! {
+            ConfigValue::Enum {
+                options: &[#(#options_refs),*],
+                default: #default_str,
+            }
         }
-        "u32" => {
-            let val = default.as_ref().expect("u32 field requires default");
-            quote! { ConfigValue::U32(#val) }
+    } else {
+        match ty_name {
+            "bool" => {
+                let val = default.as_ref().expect("bool field requires default");
+                quote! { ConfigValue::Bool(#val) }
+            }
+            "u32" => {
+                let val = default.as_ref().expect("u32 field requires default");
+                quote! { ConfigValue::U32(#val) }
+            }
+            "u64" => {
+                let val = default.as_ref().expect("u64 field requires default");
+                quote! { ConfigValue::U64(#val) }
+            }
+            "usize" => {
+                let val = default.as_ref().expect("usize field requires default");
+                quote! { ConfigValue::Usize(#val) }
+            }
+            "String" => quote! { ConfigValue::OptionalString },
+            other => panic!("unsupported config type: {other}"),
         }
-        "u64" => {
-            let val = default.as_ref().expect("u64 field requires default");
-            quote! { ConfigValue::U64(#val) }
-        }
-        "usize" => {
-            let val = default.as_ref().expect("usize field requires default");
-            quote! { ConfigValue::Usize(#val) }
-        }
-        "String" => quote! { ConfigValue::OptionalString },
-        other => panic!("unsupported config type: {other}"),
     }
 }
 
@@ -231,7 +258,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
         let ty_string = type_to_name(ty);
         let ty_name = attrs.ty_override.as_deref().unwrap_or(&ty_string);
         let desc = attrs.desc.as_deref().unwrap_or("");
-        let default_expr = config_value_expr(ty_name, &attrs.default);
+        let default_expr = config_value_expr(ty_name, &attrs.default, &attrs.enum_options);
         let min_expr = match &attrs.min {
             Some(m) => quote! { Some(#m as u64) },
             None => quote! { None },
@@ -244,6 +271,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 default: #default_expr,
                 min: #min_expr,
                 description: #desc,
+                enum_options: None,
             }
         });
 
