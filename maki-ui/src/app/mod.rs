@@ -182,6 +182,7 @@ pub struct App {
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
+    pub(crate) model_loading_state: Arc<ArcSwap<maki_providers::ModelLoadingState>>,
 }
 
 impl App {
@@ -261,6 +262,7 @@ impl App {
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
+            model_loading_state: Arc::new(ArcSwap::default()),
         };
         app.model_picker
             .set_recents(maki_storage::model::read_recents(&app.storage));

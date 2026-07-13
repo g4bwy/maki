@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -17,6 +16,7 @@ use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
+use std::sync::Arc;
 use tracing::warn;
 
 use crate::AppSession;
@@ -243,7 +243,7 @@ impl<'t> EventLoop<'t> {
             restore_session(&mut app, &handles);
         }
 
-        Ok(Self {
+        let this = Self {
             terminal,
             app,
             handles,
@@ -259,7 +259,13 @@ impl<'t> EventLoop<'t> {
             timeouts,
             ui_action_rx,
             _model_fetch_task: bg.task,
-        })
+        };
+        this.model_slot
+            .load()
+            .provider
+            .subscribe_loading(Arc::clone(&this.app.model_loading_state));
+
+        Ok(this)
     }
 
     pub(crate) fn run(mut self, initial_prompt: Option<String>) -> Result<(Option<String>, i32)> {
@@ -558,6 +564,10 @@ impl<'t> EventLoop<'t> {
                         model: new_model,
                         provider: Arc::from(new_provider),
                     }));
+                    self.model_slot
+                        .load()
+                        .provider
+                        .subscribe_loading(Arc::clone(&self.app.model_loading_state));
                 }
                 Err(e) => self.app.flash(format!("Failed to create provider: {e}")),
             },
@@ -602,6 +612,10 @@ impl<'t> EventLoop<'t> {
                     model: m,
                     provider: Arc::from(provider),
                 }));
+                self.model_slot
+                    .load()
+                    .provider
+                    .subscribe_loading(Arc::clone(&self.app.model_loading_state));
             }
         } else if let Some(builtin) = maki_config::providers::builtin_provider(&slug) {
             let spec = builtin.default_model.to_string();

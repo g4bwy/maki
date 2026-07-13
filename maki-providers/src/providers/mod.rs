@@ -18,6 +18,7 @@ pub(crate) mod deepseek;
 pub mod dynamic;
 pub(crate) mod google;
 pub(crate) mod llama_cpp;
+pub(crate) mod llama_cpp_sse;
 pub(crate) mod local;
 pub(crate) mod mistral;
 pub(crate) mod ollama;

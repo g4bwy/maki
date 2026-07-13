@@ -10,6 +10,7 @@ use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
 use maki_lua::Split;
+use maki_providers::LoadingStatus;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -299,6 +300,7 @@ impl App {
         let chat = &self.chats[render_chat];
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
         let (mode_label, mode_style) = self.mode_label();
+        let loading_state = self.model_loading_state.load();
         let ctx = StatusBarContext {
             status: &self.status,
             mode_label,
@@ -322,6 +324,14 @@ impl App {
             fast: self.state.fast,
             workflow: self.state.workflow,
             restoring: self.restoring.load(Ordering::Relaxed),
+            model_loading: if matches!(
+                loading_state.status,
+                LoadingStatus::Loading | LoadingStatus::Failed
+            ) {
+                Some(&*loading_state)
+            } else {
+                None
+            },
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

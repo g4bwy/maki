@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use flume::Sender;
 use futures::future::join_all;
 use serde::Deserialize;
@@ -10,6 +11,7 @@ use maki_config::providers::Protocol;
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
+use crate::providers::llama_cpp_sse::{ModelLoadingState, sse_loop, sse_url};
 use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
@@ -44,6 +46,7 @@ pub(crate) struct LocalEndpoint {
     thinking_budget_field: bool,
     discovery_mode: DiscoveryMode,
     protocol: Option<Protocol>,
+    sse_task: Mutex<Option<smol::Task<()>>>,
 }
 
 impl LocalEndpoint {
@@ -78,12 +81,36 @@ impl LocalEndpoint {
             thinking_budget_field: cfg.thinking_budget_field,
             discovery_mode: cfg.discovery_mode,
             protocol: resolve_protocol_for_local(cfg.slug),
+            sse_task: Mutex::new(None),
         }
     }
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
         self
+    }
+
+    /// Subscribe to llama.cpp /models/sse and update the shared loading state.
+    /// Stores the task internally; only meaningful for DiscoveryMode::LlamaCpp.
+    fn subscribe_loading_task(&self, state: Arc<ArcSwap<ModelLoadingState>>) {
+        if self.discovery_mode != DiscoveryMode::LlamaCpp {
+            return;
+        }
+        let sse_url = match self.sse_url() {
+            Some(url) => url,
+            None => return,
+        };
+        let auth = self.auth.lock().unwrap().clone();
+        let task = smol::spawn(async move {
+            sse_loop(&sse_url, &auth, state).await;
+        });
+        *self.sse_task.lock().unwrap() = Some(task);
+    }
+
+    fn sse_url(&self) -> Option<String> {
+        let auth = self.auth.lock().unwrap();
+        let base_url = auth.base_url.as_deref();
+        sse_url(base_url, self.compat.config().base_url)
     }
 
     fn build(
@@ -121,6 +148,7 @@ impl LocalEndpoint {
             thinking_budget_field: cfg.thinking_budget_field,
             discovery_mode: cfg.discovery_mode,
             protocol,
+            sse_task: Mutex::new(None),
         })
     }
 }
@@ -189,11 +217,15 @@ impl Provider for LocalEndpoint {
             }))
         })
     }
+
+    fn subscribe_loading(&self, state: Arc<ArcSwap<ModelLoadingState>>) {
+        self.subscribe_loading_task(state)
+    }
 }
 
 const LLAMACPP_DEFAULT_CTX: u32 = 128_000;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum DiscoveryMode {
     #[default]
     None,

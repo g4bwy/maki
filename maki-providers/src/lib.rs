@@ -14,6 +14,7 @@ pub use model::{
 pub use providers::Timeouts;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::dynamic;
+pub use providers::llama_cpp_sse::{LoadingStatus, ModelLoadingState};
 pub use providers::openai::auth as openai_auth;
 pub use types::{
     ContentBlock, EffortScale, IMAGE_OMITTED_NOTE, ImageMediaType, ImageSource, Message,

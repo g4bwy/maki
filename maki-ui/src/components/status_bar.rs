@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use super::{RetryInfo, Status};
 
 use crate::animation::spinner_frame;
+use crate::components::progress_bar;
 use crate::theme;
 
-use maki_providers::{ModelPricing, TokenUsage};
+use maki_providers::{LoadingStatus, ModelLoadingState, ModelPricing, TokenUsage};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -48,6 +49,7 @@ pub struct StatusBarContext<'a> {
     pub fast: bool,
     pub workflow: bool,
     pub restoring: bool,
+    pub model_loading: Option<&'a ModelLoadingState>,
 }
 
 pub struct StatusBar {
@@ -165,15 +167,20 @@ impl StatusBar {
                     0
                 };
 
+                let is_loading = ctx
+                    .model_loading
+                    .is_some_and(|s| s.status == LoadingStatus::Loading);
+                let model_label = if is_loading {
+                    Span::styled(" Loading model ", theme::current().status_dim)
+                } else {
+                    Span::styled(ctx.model_id.to_string(), theme::current().status_dim)
+                };
                 right_spans.push(Span::styled(
                     self.cwd_branch.clone(),
                     theme::current().status_dim,
                 ));
                 right_spans.push(Span::raw("  "));
-                right_spans.push(Span::styled(
-                    ctx.model_id.to_string(),
-                    theme::current().status_dim,
-                ));
+                right_spans.push(model_label);
 
                 if let Some(ref label) = ctx.thinking_label {
                     right_spans.push(Span::styled(
@@ -228,16 +235,100 @@ impl StatusBar {
             ));
         }
 
-        let [left_area, right_area] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(right_spans.iter().map(|s| s.width() as u16).sum()),
-        ])
-        .areas(area);
+        let right_width: u16 = right_spans.iter().map(|s| s.width() as u16).sum();
+        let is_loading = ctx
+            .model_loading
+            .is_some_and(|s| s.status == LoadingStatus::Loading);
+        let is_failed = ctx
+            .model_loading
+            .is_some_and(|s| s.status == LoadingStatus::Failed);
+
+        let right_alloc = if is_loading {
+            right_width.saturating_add(LOADING_BAR_WIDTH)
+        } else if is_failed {
+            right_width.saturating_add(14)
+        } else {
+            right_width
+        };
+
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_alloc)]).areas(area);
 
         frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
+
+        if let Some(state) = ctx.model_loading
+            && state.status == LoadingStatus::Loading
+        {
+            render_loading_bar(frame, right_area, state, right_spans);
+        } else if is_failed {
+            let mut spans = right_spans;
+            spans.insert(2, Span::styled(" (load failed)", theme::current().error));
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
+                right_area,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
+                right_area,
+            );
+        }
+    }
+}
+
+const LOADING_BAR_WIDTH: u16 = 20;
+
+fn render_loading_bar(
+    frame: &mut Frame,
+    right_area: Rect,
+    state: &ModelLoadingState,
+    right_spans: Vec<Span>,
+) {
+    // Context text is the last span
+    let context_span = right_spans.last().map(|s| s.width() as u16).unwrap_or(0);
+    let content_width = right_spans
+        .iter()
+        .take(right_spans.len().saturating_sub(1))
+        .map(|s| s.width() as u16)
+        .sum();
+
+    let [content_area, bar_area, context_area] = Layout::horizontal([
+        Constraint::Length(content_width),
+        Constraint::Length(LOADING_BAR_WIDTH),
+        Constraint::Length(context_span),
+    ])
+    .areas(right_area);
+
+    // All content spans except the last (context)
+    let content_spans: Vec<Span> = right_spans
+        .iter()
+        .take(right_spans.len().saturating_sub(1))
+        .cloned()
+        .collect();
+    if !content_area.is_empty() && !content_spans.is_empty() {
+        frame.render_widget(Paragraph::new(Line::from(content_spans)), content_area);
+    }
+
+    if !bar_area.is_empty() {
+        progress_bar::render(
+            frame,
+            bar_area,
+            &progress_bar::ProgressBarConfig {
+                ratio: state.progress as f64,
+                style: theme::current().progress_bar,
+                label: None,
+                label_style: None,
+                bar_width: bar_area.width,
+            },
+        );
+    }
+
+    if let Some(context) = right_spans.last()
+        && !context_area.is_empty()
+    {
         frame.render_widget(
-            Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
-            right_area,
+            Paragraph::new(Line::from(vec![context.clone()])),
+            context_area,
         );
     }
 }

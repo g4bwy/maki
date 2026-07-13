@@ -1,6 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use flume::Sender;
 use serde_json::Value;
 use strum::{Display, EnumIter, EnumString, IntoEnumIterator};
@@ -14,6 +16,7 @@ use crate::providers::copilot::Copilot;
 use crate::providers::deepseek::DeepSeek;
 use crate::providers::dynamic;
 use crate::providers::google::Google;
+use crate::providers::llama_cpp_sse::ModelLoadingState;
 use crate::providers::local::{LLAMACPP, LocalEndpoint, OLLAMA};
 use crate::providers::mistral::Mistral;
 use crate::providers::openai::OpenAi;
@@ -282,6 +285,9 @@ pub trait Provider: Send + Sync {
     }
 
     fn adjust_model(&self, _model: &mut Model) {}
+
+    /// Subscribe to model loading progress events. No-op if not supported.
+    fn subscribe_loading(&self, _state: Arc<ArcSwap<ModelLoadingState>>) {}
 }
 
 fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
