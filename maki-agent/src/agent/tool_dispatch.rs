@@ -373,8 +373,8 @@ pub(super) async fn process_tool_calls(
             immediate_errors.push(ToolDoneEvent::error(id.clone(), DOOM_LOOP_MESSAGE));
         } else {
             runnable.push((id, name.clone(), input.clone()));
+            recent_calls.record(name, &input);
         }
-        recent_calls.record(name, &input);
     }
 
     for err in &immediate_errors {
@@ -781,5 +781,36 @@ mod tests {
                 "execute must not run after denial"
             );
         });
+    }
+
+    /// Blocked calls must not pollute the ring buffer so that subsequent
+    /// identical calls are still caught.
+    #[test]
+    fn repeated_identical_calls_after_doom_loop_still_blocked() {
+        let mut rc = RecentCalls::new();
+        let input = serde_json::json!({"path": "/a"});
+        // Fill ring: two records
+        rc.record("read".to_string(), &input);
+        rc.record("read".to_string(), &input);
+        // Third call triggers doom loop — record is NOT called
+        assert!(rc.is_doom_loop("read", &input));
+        // Fourth call still triggers doom loop (ring buffer unchanged)
+        assert!(rc.is_doom_loop("read", &input));
+        // Fifth call still triggers doom loop
+        assert!(rc.is_doom_loop("read", &input));
+    }
+
+    /// A different tool call breaks the doom loop chain.
+    #[test]
+    fn different_tool_after_doom_loop_resets_chain() {
+        let mut rc = RecentCalls::new();
+        let input_a = serde_json::json!({"path": "/a"});
+        let input_b = serde_json::json!({"path": "/b"});
+        rc.record("read".to_string(), &input_a);
+        rc.record("read".to_string(), &input_a);
+        // Third would be a doom loop — but a different tool runs instead
+        rc.record("grep".to_string(), &input_b);
+        // Chain broken — next identical "read" call should not trigger
+        assert!(!rc.is_doom_loop("read", &input_a));
     }
 }

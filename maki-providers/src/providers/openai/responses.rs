@@ -309,6 +309,8 @@ pub(crate) async fn parse_sse(
                 if !delta_str.is_empty() {
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
                         tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                    } else if let Some(cid) = parsed["call_id"].as_str() {
+                        tool_accumulators.iter_mut().find(|a| a.call_id == cid)
                     } else {
                         tool_accumulators.last_mut()
                     };
@@ -354,9 +356,9 @@ pub(crate) async fn parse_sse(
                         String::new()
                     };
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
-                        tool_accumulators
-                            .iter_mut()
-                            .find(|acc| acc.output_index == idx)
+                        tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                    } else if !call_id.is_empty() {
+                        tool_accumulators.iter_mut().find(|a| a.call_id == call_id)
                     } else {
                         tool_accumulators.last_mut()
                     };
@@ -453,7 +455,11 @@ pub(crate) async fn parse_sse(
                 if let Some(u) = resp.get("usage") {
                     usage = parse_usage(u);
                 }
-                stop_reason = Some(StopReason::MaxTokens);
+                stop_reason = if tool_accumulators.is_empty() {
+                    Some(StopReason::MaxTokens)
+                } else {
+                    Some(StopReason::ToolUse)
+                };
             }
 
             "response.failed" => {
@@ -493,20 +499,29 @@ pub(crate) async fn parse_sse(
         content_blocks.push(ContentBlock::Text { text });
     }
 
-    for acc in tool_accumulators {
+    for acc in &tool_accumulators {
+        if acc.arguments.is_empty() && acc.name.is_empty() {
+            return Err(AgentError::Api {
+                status: 500,
+                message: "tool call with empty arguments".into(),
+            });
+        }
         let input: Value = match serde_json::from_str(&acc.arguments) {
             Ok(v) => {
                 debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
                 v
             }
             Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
+                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON");
+                return Err(AgentError::Api {
+                    status: 502,
+                    message: format!("malformed tool JSON for tool '{}': {e}", acc.name),
+                });
             }
         };
         content_blocks.push(ContentBlock::ToolUse {
-            id: acc.call_id,
-            name: acc.name,
+            id: acc.call_id.clone(),
+            name: acc.name.clone(),
             input,
         });
     }
@@ -852,7 +867,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"o
     }
 
     #[test]
-    fn parse_sse_malformed_tool_json_yields_empty_object() {
+    fn parse_sse_malformed_tool_json_returns_error() {
         smol::block_on(async {
             let sse = "\
 event: response.output_item.added\n\
@@ -865,12 +880,16 @@ event: response.completed\n\
 data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
 \n";
 
-            let (resp, _) = run_sse(sse).await;
-            let resp = resp.unwrap();
-            let tools: Vec<_> = resp.message.tool_uses().collect();
-            assert_eq!(tools.len(), 1);
-            assert_eq!(tools[0].1, "bash");
-            assert_eq!(*tools[0].2, Value::Object(Default::default()));
+            let (result, _) = run_sse(sse).await;
+            let err = result.unwrap_err();
+            match err {
+                AgentError::Api { status, message } => {
+                    assert_eq!(status, 502);
+                    assert!(message.contains("malformed tool JSON"));
+                    assert!(message.contains("bash"));
+                }
+                other => panic!("expected Api error, got: {other:?}"),
+            }
         })
     }
 
@@ -1132,6 +1151,118 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"ou
             assert_eq!(tools[0].2["path"], "foo.rs");
             assert_eq!(tools[0].2["old_string"], "a");
             assert_eq!(tools[0].2["new_string"], "b");
+        })
+    }
+
+    #[test]
+    fn parse_sse_parallel_tool_calls_without_output_index() {
+        smol::block_on(async {
+            // Two tool calls added before any done, interleaved deltas, no output_index
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"read\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"call_id\":\"c2\",\"delta\":\"{\\\"path\\\": \\\"/tmp\\\"}\"}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"call_id\":\"c1\",\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 2);
+            assert_eq!((tools[0].0, tools[0].1), ("c1", "bash"));
+            assert_eq!(tools[0].2["command"], "ls");
+            assert_eq!((tools[1].0, tools[1].1), ("c2", "read"));
+            assert_eq!(tools[1].2["path"], "/tmp");
+        })
+    }
+
+    #[test]
+    fn parse_sse_delta_with_call_id_no_output_index_matches_correctly() {
+        smol::block_on(async {
+            // Delta carries call_id but no output_index
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"grep\"}}\n\
+\n\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"edit\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"call_id\":\"c2\",\"delta\":\"{\\\"path\\\": \\\"f.rs\\\"}\"}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"call_id\":\"c1\",\"delta\":\"{\\\"pattern\\\": \\\"TODO\\\"}\"}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 2);
+            assert_eq!(tools[0].1, "grep");
+            assert_eq!(tools[0].2["pattern"], "TODO");
+            assert_eq!(tools[1].1, "edit");
+            assert_eq!(tools[1].2["path"], "f.rs");
+        })
+    }
+
+    #[test]
+    fn parse_sse_empty_arguments_returns_error() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"\"}}\n\
+\n\
+event: response.completed\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\
+\n";
+
+            let (result, _) = run_sse(sse).await;
+            let err = result.unwrap_err();
+            match err {
+                AgentError::Api { status, message } => {
+                    assert_eq!(status, 500);
+                    assert!(message.contains("empty arguments"));
+                }
+                other => panic!("expected Api error, got: {other:?}"),
+            }
+        })
+    }
+
+    #[test]
+    fn parse_sse_incomplete_with_tool_calls_returns_tool_use() {
+        smol::block_on(async {
+            let sse = "\
+event: response.output_item.added\n\
+data: {\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
+\n\
+event: response.function_call_arguments.delta\n\
+data: {\"call_id\":\"c1\",\"delta\":\"{\\\"command\\\": \\\"ls\\\"}\"}\n\
+\n\
+event: response.incomplete\n\
+data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\
+\n";
+
+            let (resp, _) = run_sse(sse).await;
+            let resp = resp.unwrap();
+            assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
+            let tools: Vec<_> = resp.message.tool_uses().collect();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].1, "bash");
         })
     }
 }
