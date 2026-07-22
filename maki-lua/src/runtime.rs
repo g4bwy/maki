@@ -2277,8 +2277,12 @@ pub fn spawn(
                                 let lua = rt.lua.clone();
                                 ex.spawn(async move {
                                     let run = async {
+                                        let args_table = lua.create_table()?;
+                                        for (i, word) in args.split_whitespace().enumerate() {
+                                            args_table.raw_set(i + 1, word)?;
+                                        }
                                         let thread = lua.create_thread(func)?;
-                                        thread.into_async::<()>(args)?.await
+                                        thread.into_async::<()>(args_table)?.await
                                     };
                                     if let Err(e) = run_detached(&lua, run).await {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
