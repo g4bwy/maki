@@ -149,6 +149,7 @@ pub struct App {
     pub(super) file_picker: FilePickerModal,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) plan_form: PlanForm,
+    pub(super) effort_slider: crate::components::step_slider::StepSlider,
     pub(super) status_bar: StatusBar,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -234,6 +235,7 @@ impl App {
             file_picker: FilePickerModal::new(),
             permission_prompt: PermissionPrompt::new(),
             plan_form: PlanForm::new(),
+            effort_slider: crate::components::step_slider::StepSlider::new(),
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
             state,
@@ -504,6 +506,15 @@ impl App {
             if action != PlanFormAction::Passthrough {
                 return Some(self.handle_plan_form_action(action));
             }
+        }
+
+        if self.effort_slider.is_visible() {
+            if key.code == KeyCode::Esc {
+                self.effort_slider.hide();
+                return Some(vec![]);
+            }
+            self.effort_slider.handle_key(key, crate::components::step_slider::EFFORT_STEPS.len());
+            return Some(vec![]);
         }
 
         if self.help_modal.is_open() {
@@ -1231,6 +1242,11 @@ impl App {
                     }
                     Err(msg) => self.flash(msg.into()),
                 }
+                vec![]
+            }
+
+            "/effort" => {
+                self.effort_slider.show();
                 vec![]
             }
             "/fast" => {

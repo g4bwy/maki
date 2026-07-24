@@ -98,6 +98,16 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 0,
     },
     BuiltinCommand {
+        name: "/effort",
+        description: "Select reasoning effort level",
+        max_args: 0,
+    },
+    BuiltinCommand {
+        name: "/login",
+        description: "Authenticate with an LLM provider",
+        max_args: 0,
+    },
+    BuiltinCommand {
         name: "/workflow",
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,

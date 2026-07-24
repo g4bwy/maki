@@ -147,9 +147,31 @@ impl App {
     }
 
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
+        use crate::components::step_slider::EFFORT_STEPS;
+        use ratatui::widgets::Paragraph;
+
+        let msg_area = if self.effort_slider.is_visible() {
+            let [rest, slider_area] =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).areas(layout.msg_area);
+
+            self.effort_slider.render(frame, slider_area, "Effort", EFFORT_STEPS);
+            frame.render_widget(
+                Paragraph::new(self.effort_slider.description_line(EFFORT_STEPS)),
+                Rect {
+                    x: slider_area.x,
+                    y: slider_area.y + 2,
+                    width: slider_area.width,
+                    height: 1,
+                },
+            );
+            rest
+        } else {
+            layout.msg_area
+        };
+
         let accent = self.effective_mode_color();
         self.chats[render_chat].set_accent(accent);
-        self.chats[render_chat].view(frame, layout.msg_area, self.selection_state.is_some());
+        self.chats[render_chat].view(frame, msg_area, self.selection_state.is_some());
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
@@ -255,6 +277,7 @@ impl App {
 
     fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
         let full = frame.area();
+
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {
             overlay_rect = r;
