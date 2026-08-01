@@ -4142,6 +4142,51 @@ maki.ui.flash("Copied to clipboard!")
 
 ---
 
+### `maki.ui.set_thinking()` {#maki-ui-set_thinking}
+
+```lua
+maki.ui.set_thinking({setting})
+```
+
+Set the session's thinking (reasoning effort) mode. Accepts the same
+values as `/thinking`: `"off"`, `"adaptive"`, an effort level
+(`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`), or a
+token budget integer.
+
+**Parameters:**
+
+- `{setting}` (`string|integer`) Thinking mode or effort level.
+
+**Example:**
+
+```lua
+maki.ui.set_thinking("high")
+maki.ui.set_thinking("off")
+```
+
+---
+
+### `maki.ui.get_thinking()` {#maki-ui-get_thinking}
+
+```lua
+maki.ui.get_thinking()
+```
+
+Get the session's current thinking (reasoning effort) mode.
+
+**Returns:** (`string`) Current thinking mode: `"off"`, `"adaptive"`, an effort
+  level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`),
+  or a token budget number.
+
+**Example:**
+
+```lua
+local mode = maki.ui.get_thinking()
+print(mode) -- e.g. "low"
+```
+
+---
+
 ### `maki.ui.open_editor()` {#maki-ui-open_editor}
 
 ```lua

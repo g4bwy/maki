@@ -439,6 +439,10 @@ pub enum UiAction {
     WinRestView {
         scroll_top: u16,
     },
+    SetThinking(String),
+    GetThinking {
+        reply_tx: flume::Sender<String>,
+    },
 }
 
 /// Hand an action to the UI event loop. A full or closed channel means the

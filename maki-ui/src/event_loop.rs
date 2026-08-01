@@ -24,6 +24,7 @@ use maki_config::UiConfig;
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, SessionReply, SessionRequest, UiAction,
 };
+use maki_providers::ThinkingConfig;
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
 use maki_providers::{Message, Model};
@@ -598,6 +599,21 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::WinRestView { scroll_top } => {
                 self.focused_app().set_scroll_top(scroll_top);
+            }
+            UiAction::SetThinking(setting) => {
+                let app = self.focused_app();
+                let current = app.state.thinking;
+                match ThinkingConfig::parse(&setting, current) {
+                    Ok(thinking) => {
+                        app.state.thinking = thinking;
+                        app.flash(format!("Thinking: {thinking}"));
+                    }
+                    Err(msg) => app.flash(msg.into()),
+                }
+            }
+            UiAction::GetThinking { reply_tx } => {
+                let thinking = self.focused_app().state.thinking;
+                let _ = reply_tx.send(thinking.to_string());
             }
         }
     }

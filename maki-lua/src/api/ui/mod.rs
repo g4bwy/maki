@@ -247,6 +247,42 @@ fn flash(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, msg: String) -> LuaResu
     Ok(())
 }
 
+/// Set the session's thinking (reasoning effort) mode. Accepts the same
+/// values as `/thinking`: `"off"`, `"adaptive"`, an effort level
+/// (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`), or a
+/// token budget integer.
+///
+/// @param setting string|integer Thinking mode or effort level.
+/// @return
+/// @example
+/// maki.ui.set_thinking("high")
+/// maki.ui.set_thinking("off")
+#[lua_fn]
+fn set_thinking(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, setting: String) -> LuaResult<()> {
+    let _ = tx.try_send(UiAction::SetThinking(setting));
+    Ok(())
+}
+
+/// Get the session's current thinking (reasoning effort) mode.
+///
+/// @return (string) Current thinking mode: `"off"`, `"adaptive"`, an effort
+///   level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`),
+///   or a token budget number.
+/// @example
+/// local mode = maki.ui.get_thinking()
+/// print(mode) -- e.g. "low"
+#[lua_fn]
+async fn get_thinking(_lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<String> {
+    let (reply_tx, reply_rx) = flume::bounded::<String>(1);
+    if tx.try_send(UiAction::GetThinking { reply_tx }).is_err() {
+        return Ok("off".to_string());
+    }
+    match reply_rx.recv_async().await {
+        Ok(mode) => Ok(mode),
+        Err(_) => Ok("off".to_string()),
+    }
+}
+
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
 /// it to close. This suspends the TUI while the editor is running.
 /// Returns the editor's exit code so you can check if the user saved.
@@ -420,7 +456,7 @@ lua_table! {
     extend "maki.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual open_editor, manual open_win, manual set_status_hint,
+        manual flash, manual set_thinking, manual get_thinking, manual open_editor, manual open_win, manual set_status_hint,
     ]
 }
 
@@ -434,6 +470,8 @@ pub(crate) fn create_ui_table(
 
     if let Some(tx) = ui_action_tx {
         flash__register(&t, lua, tx.clone())?;
+        set_thinking__register(&t, lua, tx.clone())?;
+        get_thinking__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         open_win__register(&t, lua, tx)?;
     }
