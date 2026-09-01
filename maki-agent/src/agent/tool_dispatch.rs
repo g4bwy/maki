@@ -856,7 +856,7 @@ pub(super) async fn process_tool_calls(
 
     let mut all_results = results;
     all_results.extend(immediate_errors);
-    let tool_msg = crate::types::tool_results(all_results);
+    let tool_msg = crate::types::tool_results(all_results, ctx.config.compaction_tool_cap_bytes);
     event_tx.send(AgentEvent::ToolResultsSubmitted {
         message: Box::new(tool_msg.clone()),
     })?;

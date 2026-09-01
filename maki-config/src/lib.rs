@@ -31,6 +31,12 @@ pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_MAX_CONTINUATION_TURNS: u32 = 3;
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+/// Recent history (in tokens) compaction always keeps whole: a model needs the latest
+/// turns to stay coherent, so pruning collapses output behind this tail before touching it.
+pub const DEFAULT_COMPACTION_RECENT_TAIL: u32 = 20_000;
+/// Tool output at or above this size (bytes) is collapsed to a placeholder during
+/// compaction so a single oversized block cannot pin the next request over the window.
+pub const DEFAULT_COMPACTION_TOOL_CAP_BYTES: usize = 50_000;
 
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_LOW_SPEED_TIMEOUT_SECS: u64 = 120;
@@ -593,6 +599,8 @@ pub struct AgentFileConfig {
     pub max_output_lines: Option<usize>,
     pub max_continuation_turns: Option<u32>,
     pub compaction_buffer: Option<CompactionBuffer>,
+    pub compaction_recent_tail: Option<u32>,
+    pub compaction_tool_cap_bytes: Option<usize>,
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
     pub stale_read_check: Option<bool>,
@@ -608,6 +616,8 @@ impl AgentFileConfig {
             max_output_lines,
             max_continuation_turns,
             compaction_buffer,
+            compaction_recent_tail,
+            compaction_tool_cap_bytes,
             compaction_instructions,
             post_compaction_instructions,
             stale_read_check,
@@ -1166,6 +1176,20 @@ pub struct AgentConfig {
     pub compaction_buffer: CompactionBuffer,
 
     #[config(
+        default = DEFAULT_COMPACTION_RECENT_TAIL,
+        ty = "u32",
+        desc = "Recent history (tokens) compaction keeps whole before collapsing older output"
+    )]
+    pub compaction_recent_tail: u32,
+
+    #[config(
+        default = DEFAULT_COMPACTION_TOOL_CAP_BYTES,
+        ty = "u32",
+        desc = "Tool output at or above this size (bytes) is collapsed to a placeholder during compaction"
+    )]
+    pub compaction_tool_cap_bytes: usize,
+
+    #[config(
         ty = "String",
         default = "None",
         desc = "Extra instructions appended to the compaction summary prompt"
@@ -1212,6 +1236,12 @@ impl AgentConfig {
                 .max_continuation_turns
                 .unwrap_or(DEFAULT_MAX_CONTINUATION_TURNS),
             compaction_buffer: file.compaction_buffer.unwrap_or(DEFAULT_COMPACTION_BUFFER),
+            compaction_recent_tail: file
+                .compaction_recent_tail
+                .unwrap_or(DEFAULT_COMPACTION_RECENT_TAIL),
+            compaction_tool_cap_bytes: file
+                .compaction_tool_cap_bytes
+                .unwrap_or(DEFAULT_COMPACTION_TOOL_CAP_BYTES),
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             stale_read_check: file.stale_read_check.unwrap_or(true),

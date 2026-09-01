@@ -27,6 +27,10 @@ use maki_config::{ModelPolicy, ToolOutputLines};
 use maki_storage::id::SessionRef;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+/// Overflow recovery is self-limiting: compacting on an overflow error should be rare
+/// (the pre-request check usually stops it earlier), so cap the retries rather than
+/// let a pathological session compact forever.
+const MAX_OVERFLOW_RETRIES: u32 = 3;
 const NUDGE_PROMPT: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// A model that stalls once often stalls again on the retry, so it gets
 /// plenty of chances before the turn ends empty handed.
@@ -107,6 +111,7 @@ pub struct Agent<'h> {
     auto_compact: bool,
     loaded_instructions: LoadedInstructions,
     rollback_len: usize,
+    overflow_retries: u32,
     mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -150,6 +155,7 @@ impl<'h> Agent<'h> {
             auto_compact: compaction::auto_compact_enabled(),
             loaded_instructions: LoadedInstructions::new(),
             rollback_len: 0,
+            overflow_retries: 0,
             mcp: None,
             reauth_attempts: 0,
             opts: RequestOptions::default(),
@@ -304,6 +310,24 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        // Avoid sending a request that is already over the useful window: compact
+        // before the server can reject it and stick the session. The estimate is
+        // cheap (chars/4) and conservative, so it only nudges the same decision
+        // the post-turn check would have made a moment later. `request_tools` is
+        // cheap too, so rebuild it after compaction for the send below.
+        let tools = self.request_tools();
+        let estimated =
+            estimate_request_tokens(self.history.as_slice(), &self.system, tools.as_ref());
+        drop(tools);
+        if self.auto_compact
+            && estimated >= compaction::usable_window(&self.model, self.config.compaction_buffer)
+        {
+            self.event_tx.send(AgentEvent::AutoCompacting {
+                context_size: estimated,
+                context_window: self.model.context_window,
+            })?;
+            self.do_compact().await?;
+        }
         let tools = self.request_tools();
         let response = match stream_with_retry(
             &*self.provider,
@@ -320,6 +344,7 @@ impl<'h> Agent<'h> {
         {
             Ok(r) => {
                 self.reauth_attempts = 0;
+                self.overflow_retries = 0;
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
@@ -337,6 +362,20 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Other(e)) if e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
+            }
+            Err(StreamError::Other(e)) if e.is_context_overflow() && self.auto_compact => {
+                if self.overflow_retries >= MAX_OVERFLOW_RETRIES {
+                    error!(error = %e, retries = self.overflow_retries, "context overflow could not be compacted away");
+                    return Err(e);
+                }
+                self.overflow_retries += 1;
+                warn!(error = %e, attempt = self.overflow_retries, "request exceeded context window, compacting and retrying");
+                self.event_tx.send(AgentEvent::AutoCompacting {
+                    context_size: self.context_size,
+                    context_window: self.model.context_window,
+                })?;
+                self.do_compact().await?;
+                return Ok(TurnOutcome::Continue);
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -623,6 +662,15 @@ impl<'h> Agent<'h> {
 
 const CHARS_PER_TOKEN: usize = 4;
 
+/// Best-effort size of the request we are about to send: messages plus the system
+/// prompt and tool schemas that `estimate_message_tokens` deliberately omits. This is a
+/// plain chars/4 sum, never a substitute for the provider's measured usage, but it is
+/// cheap and catches the case where a single big block would overshoot before we send it.
+fn estimate_request_tokens(history: &[Message], system: &str, tools: &Value) -> u32 {
+    let baseline = (system.len() + tools.to_string().len()) / CHARS_PER_TOKEN;
+    baseline as u32 + estimate_message_tokens(history)
+}
+
 /// Counts message content only. The system prompt and the tool schemas, a five
 /// figure baseline on a full tool set, stay invisible here, so never let this
 /// replace a context size the provider measured.
@@ -714,6 +762,43 @@ mod tests {
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 Ok(responses.remove(0))
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    /// Returns a pre-programmed queue of results, including errors, so the normal-turn
+    /// overflow-recovery path can be exercised end to end.
+    struct FallibleProvider {
+        responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
+    }
+
+    impl FallibleProvider {
+        fn new(responses: Vec<Result<StreamResponse, AgentError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+            }
+        }
+    }
+
+    impl Provider for FallibleProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                let mut responses = self.responses.lock().unwrap();
+                assert!(!responses.is_empty(), "FallibleProvider: no more responses");
+                responses.remove(0)
             })
         }
 
@@ -1238,6 +1323,82 @@ mod tests {
                 )),
                 expected,
             );
+        });
+    }
+
+    #[test]
+    fn estimate_request_tokens_includes_system_and_schema() {
+        let system = "s".repeat(4_000);
+        let tools = serde_json::json!([{"name": "t", "description": "x".repeat(4_000)}]);
+        let messages = vec![Message::user("m".repeat(400))];
+        let with_baseline = estimate_request_tokens(&messages, &system, &tools);
+        let messages_only = estimate_message_tokens(&messages);
+        assert!(with_baseline > messages_only);
+    }
+
+    #[test]
+    fn pre_request_check_compacts_when_estimate_exceeds_usable_window() {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(
+                // One response for the compaction summariser, one for the real request.
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.model = Arc::new(small_context_model(2_000, 512));
+            let mut input = default_input();
+            input.message = "x".repeat(100_000);
+            agent.run(input).await.unwrap();
+            drop(agent);
+            assert!(has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::AutoCompacting { .. }
+            )));
+        });
+    }
+
+    #[test]
+    fn pre_request_check_skips_under_usable_window() {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.model = Arc::new(small_context_model(1_000_000, 8_192));
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert!(!has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::AutoCompacting { .. }
+            )));
+        });
+    }
+
+    #[test]
+    fn overflow_error_recovers_with_compact_and_continue() {
+        smol::block_on(async {
+            let overflow = || AgentError::Api {
+                status: 413,
+                message: "too long".into(),
+            };
+            let provider = FallibleProvider::new(vec![
+                Err(overflow()),
+                Ok(text_response(StopReason::EndTurn)),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            agent.model = Arc::new(small_context_model(1_000_000, 8_192));
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+            assert!(has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::AutoCompacting { .. }
+            )));
         });
     }
 

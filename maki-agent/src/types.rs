@@ -519,13 +519,14 @@ impl ToolDoneEvent {
     }
 }
 
-pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
+pub fn tool_results(results: Vec<ToolDoneEvent>, cap_bytes: usize) -> Message {
     let mut content = Vec::with_capacity(results.len());
     let mut images = Vec::new();
     for r in results {
+        let text = cap_tool_result_text(r.output.as_text(), cap_bytes);
         content.push(ContentBlock::ToolResult {
             tool_use_id: r.id,
-            content: r.output.as_text(),
+            content: text,
             is_error: r.is_error,
         });
         if let ToolOutput::Image { source, .. } = &r.output {
@@ -541,6 +542,24 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
         role: Role::User,
         content,
         ..Default::default()
+    }
+}
+
+/// Keep a single tool result from blowing the request on its own: any text over
+/// `cap_bytes` is collapsed to a short preview. Trailing-content is a harder
+/// character boundary than the whole thing, so this stops the base64/huge-file case
+/// before it can stick the session.
+fn cap_tool_result_text(text: String, cap_bytes: usize) -> String {
+    if text.len() > cap_bytes {
+        const NOTE: &str = "\n[tool result truncated: too large to keep in context]";
+        let keep = cap_bytes.saturating_sub(NOTE.len());
+        if let Some(boundary) = (0..=keep).rev().find(|&i| text.is_char_boundary(i)) {
+            format!("{}...{NOTE}", &text[..boundary])
+        } else {
+            NOTE.to_string()
+        }
+    } else {
+        text
     }
 }
 
@@ -1221,24 +1240,27 @@ mod tests {
 
     #[test]
     fn tool_results_builds_message_with_tool_result_blocks() {
-        let msg = tool_results(vec![
-            ToolDoneEvent {
-                id: "t1".into(),
-                tool: Arc::from("bash"),
-                output: ToolOutput::Plain("ok".into()),
-                is_error: false,
-                annotation: None,
-                written_path: None,
-            },
-            ToolDoneEvent {
-                id: "t2".into(),
-                tool: Arc::from("read"),
-                output: ToolOutput::Plain("fail".into()),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-            },
-        ]);
+        let msg = tool_results(
+            vec![
+                ToolDoneEvent {
+                    id: "t1".into(),
+                    tool: Arc::from("bash"),
+                    output: ToolOutput::Plain("ok".into()),
+                    is_error: false,
+                    annotation: None,
+                    written_path: None,
+                },
+                ToolDoneEvent {
+                    id: "t2".into(),
+                    tool: Arc::from("read"),
+                    output: ToolOutput::Plain("fail".into()),
+                    is_error: true,
+                    annotation: None,
+                    written_path: None,
+                },
+            ],
+            usize::MAX,
+        );
         assert!(matches!(msg.role, Role::User));
         assert_eq!(msg.content.len(), 2);
         assert!(
@@ -1267,11 +1289,14 @@ mod tests {
             written_path: None,
         };
 
-        let msg = tool_results(vec![
-            done("t1", image("aGVsbG8=")),
-            done("t2", ToolOutput::Plain("ok".into())),
-            done("t3", image("aW1n")),
-        ]);
+        let msg = tool_results(
+            vec![
+                done("t1", image("aGVsbG8=")),
+                done("t2", ToolOutput::Plain("ok".into())),
+                done("t3", image("aW1n")),
+            ],
+            usize::MAX,
+        );
         assert_eq!(msg.content.len(), 5);
         assert!(
             matches!(&msg.content[0], ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "t1" && content == "[image: pic.png 1KB]")
@@ -1288,6 +1313,19 @@ mod tests {
         assert!(
             matches!(&msg.content[4], ContentBlock::Image { source } if &*source.data == "aW1n")
         );
+    }
+
+    #[test_case("small".to_string(), 100, "small" ; "under_cap_untouched")]
+    #[test_case("x".repeat(1_000), 50, "..." ; "over_cap_collapsed")]
+    fn tool_result_cap_truncates_oversized_text(text: String, cap: usize, marker: &str) {
+        let original_len = text.len();
+        let out = cap_tool_result_text(text, cap);
+        if marker == "..." {
+            assert!(out.contains(marker));
+            assert!(out.len() < original_len);
+        } else {
+            assert_eq!(out, marker);
+        }
     }
 
     #[test_case(

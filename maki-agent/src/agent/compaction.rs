@@ -38,7 +38,7 @@ pub(super) async fn compact_history(
     remove_orphaned_tool_results(&mut compaction_history);
     strip_images(&mut compaction_history);
     strip_thinking(&mut compaction_history);
-    strip_old_tool_results(&mut compaction_history);
+    strip_old_tool_results(&mut compaction_history, config.compaction_recent_tail);
     let summary_prompt = match normalize(&config.compaction_instructions) {
         Some(extra) => format!(
             "{}\n\nAdditional instructions:\n{extra}",
@@ -77,13 +77,30 @@ pub(super) async fn compact_history(
             }
             Err(StreamError::Other(e)) if e.is_context_overflow() && attempt < max_attempts - 1 => {
                 last_error = Some(e);
-                truncate_oldest_round(&mut compaction_history);
+                // A recent oversized block (single huge tool result) beats oldest-round
+                // truncation: it lives in the tail that truncation refuses to touch.
+                // Collapse any block that would alone blow the usable window first, then
+                // fall back to dropping the oldest round.
+                let collapsed = strip_overlarge_tool_results(
+                    &mut compaction_history,
+                    model,
+                    config.compaction_buffer,
+                );
+                if !collapsed {
+                    truncate_oldest_round(&mut compaction_history);
+                }
             }
             Err(e) => return Err(e.into()),
         }
     }
 
-    Err(last_error.unwrap())
+    Err(last_error.unwrap_or_else(|| AgentError::Config {
+        message: format!(
+            "compaction failed after {max_attempts} attempts: the context still overflows \
+             the {}-token window even after pruning",
+            model.context_window
+        ),
+    }))
 }
 
 fn finish_compact(
@@ -162,10 +179,17 @@ pub async fn compact(
 }
 
 pub(super) fn is_overflow(usage: &TokenUsage, model: &Model, buffer: CompactionBuffer) -> bool {
-    let usable = model
-        .context_window
-        .saturating_sub(buffer.resolve(model.context_window));
-    usage.context_tokens() >= usable
+    usage.context_tokens() >= usable_window(model, buffer)
+}
+
+/// The largest request the model can carry: its full window minus the headroom the
+/// response needs (the larger of the buffer reservation and the model's max output).
+/// Every path that decides whether to compact agrees on this one number.
+pub(super) fn usable_window(model: &Model, buffer: CompactionBuffer) -> u32 {
+    let reserve = buffer
+        .resolve(model.context_window)
+        .max(model.max_output_tokens.unwrap_or(0));
+    model.context_window.saturating_sub(reserve)
 }
 
 fn strip_images(messages: &mut [Message]) {
@@ -187,26 +211,62 @@ fn strip_thinking(messages: &mut [Message]) {
 }
 
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
-const KEEP_LAST_TOOL_RESULTS: usize = 3;
+const CHARS_PER_TOKEN: usize = 4;
 
-fn strip_old_tool_results(messages: &mut [Message]) {
-    let total: usize = messages
+/// Collapse old tool results to a placeholder, keeping the trailing `tail_budget`
+/// tokens of tool-result content whole so the model still sees recent observations.
+/// Tool-call/result pairs are never split: it only rewrites result *content*, never
+/// the message boundaries or the companion tool-use.
+fn strip_old_tool_results(messages: &mut [Message], tail_budget: u32) {
+    let total_bytes: usize = messages
         .iter()
         .flat_map(|m| &m.content)
-        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
-        .count();
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { content, .. } => Some(content.len()),
+            _ => None,
+        })
+        .sum();
+    let tail_bytes = usize::try_from(tail_budget).unwrap_or(usize::MAX) * CHARS_PER_TOKEN;
 
-    let mut seen = 0;
+    let mut seen_bytes = 0usize;
     for msg in messages {
         for block in &mut msg.content {
             if let ContentBlock::ToolResult { content, .. } = block {
-                if seen < total.saturating_sub(KEEP_LAST_TOOL_RESULTS) {
+                // Collapse from the front until only the trailing `tail_bytes` of
+                // tool-result content remains whole.
+                if seen_bytes.saturating_add(content.len())
+                    <= total_bytes.saturating_sub(tail_bytes)
+                {
                     *content = TOOL_RESULT_PLACEHOLDER.into();
                 }
-                seen += 1;
+                seen_bytes += content.len();
             }
         }
     }
+}
+
+/// Collapse any single tool result whose content could alone push the request over the
+/// usable window. Returns true if at least one was collapsed. This is the backstop for
+/// a huge recent block that [`strip_old_tool_results`]'s recent-tail budget keeps.
+fn strip_overlarge_tool_results(
+    messages: &mut [Message],
+    model: &Model,
+    buffer: CompactionBuffer,
+) -> bool {
+    let usable = usable_window(model, buffer);
+    let mut collapsed = false;
+    for msg in messages {
+        for block in &mut msg.content {
+            if let ContentBlock::ToolResult { content, .. } = block
+                && !content.is_empty()
+                && (content.len() / CHARS_PER_TOKEN) as u32 >= usable / 2
+            {
+                *content = format!("{TOOL_RESULT_PLACEHOLDER} (oversized result collapsed)");
+                collapsed = true;
+            }
+        }
+    }
+    collapsed
 }
 
 fn truncate_oldest_round(messages: &mut Vec<Message>) {
@@ -512,6 +572,13 @@ mod tests {
         expected: bool,
     ) {
         let model = small_context_model(ctx_window);
+        let model = {
+            let mut m = model;
+            // Zero the model's default output headroom so the buffer dominates and the
+            // table below reads the buffer-boundary logic in isolation.
+            m.max_output_tokens = Some(0);
+            m
+        };
         let usage = TokenUsage {
             input,
             output,
@@ -529,7 +596,8 @@ mod tests {
     #[test_case(CompactionBuffer::Tokens(10_000), 54_000, true  ; "explicit_tokens_honored")]
     #[test_case(CompactionBuffer::Percent(50),    32_000, true  ; "explicit_percent_at_threshold")]
     fn overflow_with_explicit_buffer(buffer: CompactionBuffer, input: u32, expected: bool) {
-        let model = small_context_model(64_000);
+        let mut model = small_context_model(64_000);
+        model.max_output_tokens = Some(0);
         let usage = TokenUsage {
             input,
             ..Default::default()
@@ -610,7 +678,7 @@ mod tests {
             ],
             ..Default::default()
         }];
-        strip_old_tool_results(&mut messages);
+        strip_old_tool_results(&mut messages, 4);
         assert_eq!(messages[0].content.len(), 6);
         assert!(
             matches!(&messages[0].content[0], ContentBlock::ToolResult { content, tool_use_id, .. } if content == TOOL_RESULT_PLACEHOLDER && tool_use_id == "t1")
@@ -896,5 +964,130 @@ mod tests {
         assert!(
             matches!(&messages[0].content[..], [ContentBlock::Text { text }] if text == "keep me")
         );
+    }
+
+    #[test_case(50_000, 4_000, 40_000, CompactionBuffer::Percent(20) ; "percent_buffer_larger")]
+    #[test_case(50_000, 60_000, 0,       CompactionBuffer::Tokens(1_000) ; "output_headroom_larger")]
+    fn usable_window_takes_max_of_buffer_and_output(
+        context_window: u32,
+        max_output: u32,
+        expected: u32,
+        buffer: CompactionBuffer,
+    ) {
+        let mut model = small_context_model(context_window);
+        model.max_output_tokens = Some(max_output);
+        assert_eq!(usable_window(&model, buffer), expected);
+    }
+
+    #[test]
+    fn strip_overlarge_tool_results_collapses_recent_huge_block() {
+        let mut messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "x".repeat(1_000_000),
+                    is_error: false,
+                }],
+                ..Default::default()
+            },
+            Message::user("prompt".into()),
+        ];
+        assert!(strip_overlarge_tool_results(
+            &mut messages,
+            &small_context_model(200_000),
+            CompactionBuffer::Percent(20),
+        ));
+        let collapsed = &messages[0].content[0];
+        assert!(
+            matches!(collapsed, ContentBlock::ToolResult { content, .. } if content.contains(TOOL_RESULT_PLACEHOLDER))
+        );
+        assert!(
+            matches!(&messages[0].content[0], ContentBlock::ToolResult { content, .. } if content.len() < 1_000)
+        );
+    }
+
+    #[test]
+    fn compact_history_recovers_when_huge_block_is_recent() {
+        smol::block_on(async {
+            const CONGEST: &str = "too long";
+            let provider = MockProvider::new(vec![
+                Err(AgentError::Api {
+                    status: 413,
+                    message: CONGEST.into(),
+                }),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("request".into()),
+                tool_use("t1"),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "x".repeat(1_000_000),
+                        is_error: false,
+                    }],
+                    ..Default::default()
+                },
+                Message::user("prompt".into()),
+            ]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            compact_history(
+                &provider,
+                &small_context_model(200_000),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+            )
+            .await
+            .unwrap();
+
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1]
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { content, .. } if content.contains(TOOL_RESULT_PLACEHOLDER))));
+        });
+    }
+
+    #[test]
+    fn compact_history_stops_after_max_overflow_attempts() {
+        smol::block_on(async {
+            const CONGEST: &str = "too long";
+            let provider = MockProvider::new(vec![
+                Err(AgentError::Api {
+                    status: 413,
+                    message: CONGEST.into(),
+                }),
+                Err(AgentError::Api {
+                    status: 413,
+                    message: CONGEST.into(),
+                }),
+                Err(AgentError::Api {
+                    status: 413,
+                    message: CONGEST.into(),
+                }),
+            ]);
+            let mut history = History::new(vec![Message::user("go".into())]);
+            let (raw_tx, _rx) = flume::unbounded();
+
+            let err = compact_history(
+                &provider,
+                &small_context_model(200_000),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &CancelToken::none(),
+                &AgentConfig::default(),
+            )
+            .await
+            .expect_err("overflow that never resolves must fail");
+
+            assert!(matches!(err, AgentError::Api { status: 413, .. }));
+            assert_eq!(provider.requests.lock().unwrap().len(), 3);
+        });
     }
 }
