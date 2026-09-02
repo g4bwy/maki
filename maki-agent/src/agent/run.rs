@@ -363,12 +363,28 @@ impl<'h> Agent<'h> {
             Err(StreamError::Other(e)) if e.is_auth_error() => {
                 return self.wait_for_reauth(e).await;
             }
-            Err(StreamError::Other(e)) if e.is_context_overflow() && self.auto_compact => {
+            Err(StreamError::Other(e)) if e.is_context_overflow() => {
                 if self.overflow_retries >= MAX_OVERFLOW_RETRIES {
                     error!(error = %e, retries = self.overflow_retries, "context overflow could not be compacted away");
                     return Err(e);
                 }
                 self.overflow_retries += 1;
+                // With auto-compact off we still must not stick the session:
+                // collapse oversized tool results (the least invasive cut) and retry
+                // instead of failing. This mirrors opencode, where overflow recovery
+                // runs even when proactive compaction is disabled.
+                if !self.auto_compact {
+                    let mut msgs = self.history.as_slice().to_vec();
+                    if compaction::strip_overlarge_tool_results(
+                        &mut msgs,
+                        &self.model,
+                        self.config.compaction_buffer,
+                    ) {
+                        self.history.replace(msgs);
+                        return Ok(TurnOutcome::Continue);
+                    }
+                    return Err(e);
+                }
                 warn!(error = %e, attempt = self.overflow_retries, "request exceeded context window, compacting and retrying");
                 self.event_tx.send(AgentEvent::AutoCompacting {
                     context_size: self.context_size,
@@ -1399,6 +1415,54 @@ mod tests {
                 e,
                 AgentEvent::AutoCompacting { .. }
             )));
+        });
+    }
+
+    #[test]
+    fn overflow_recovers_with_prune_when_auto_compact_is_off() {
+        smol::block_on(async {
+            let overflow = || AgentError::Api {
+                status: 413,
+                message: "too long".into(),
+            };
+            let provider = FallibleProvider::new(vec![
+                Err(overflow()),
+                Ok(text_response(StopReason::EndTurn)),
+            ]);
+            let mut history = History::new(vec![
+                Message::user("request".into()),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "t1".into(),
+                        content: "x".repeat(2_000_000),
+                        is_error: false,
+                    }],
+                    ..Default::default()
+                },
+                Message::user("prompt".into()),
+            ]);
+            let (mut agent, event_rx) = make_agent(provider, &mut history);
+            agent.model = Arc::new(small_context_model(1_000_000, 8_192));
+            agent.auto_compact = false;
+            // Do not trigger the pre-request estimate path.
+            let mut input = default_input();
+            input.message = "go".into();
+            agent.run(input).await.unwrap();
+            drop(agent);
+            // Prune recovery must not emit AutoCompacting (auto-compact is off),
+            // and the run must not error.
+            assert!(!has_event(&drain_events(&event_rx), |e| matches!(
+                e,
+                AgentEvent::AutoCompacting { .. }
+            )));
+            assert!(
+                history
+                    .as_slice()
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .any(|b| matches!(b, ContentBlock::ToolResult { content, .. } if content.contains("[tool result]")))
+            );
         });
     }
 

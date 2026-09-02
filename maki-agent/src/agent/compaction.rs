@@ -248,7 +248,7 @@ fn strip_old_tool_results(messages: &mut [Message], tail_budget: u32) {
 /// Collapse any single tool result whose content could alone push the request over the
 /// usable window. Returns true if at least one was collapsed. This is the backstop for
 /// a huge recent block that [`strip_old_tool_results`]'s recent-tail budget keeps.
-fn strip_overlarge_tool_results(
+pub(super) fn strip_overlarge_tool_results(
     messages: &mut [Message],
     model: &Model,
     buffer: CompactionBuffer,
