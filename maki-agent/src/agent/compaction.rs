@@ -75,6 +75,7 @@ pub(super) async fn compact_history(
             cancel,
             RequestOptions::default(),
             None,
+            0,
         )
         .await
         {

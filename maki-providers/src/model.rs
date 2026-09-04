@@ -14,12 +14,27 @@ use maki_config::ModelPolicy;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredTokenUsage};
 use serde::{Deserialize, Serialize};
 
+use serde_json::Value;
+
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model_registry;
 use crate::providers::{anthropic, custom, dynamic};
-use crate::types::ThinkingFields;
+use crate::types::{ContentBlock, Message, ThinkingFields};
 
 const PER_MILLION: f64 = 1_000_000.0;
+
+/// vLLM rejects `max_tokens < 1` outright, so even a fully-used window must
+/// send a positive budget.
+const MIN_OUTPUT_BUDGET: u32 = 1;
+
+/// Headroom subtracted from the remaining context when sizing the output
+/// budget: the gauge is the previous prompt, and the increment since it was
+/// measured is estimated optimistically (bytes/4 against ~3-byte-per-token
+/// code), so trusting it exactly can still overshoot the window.
+const MIN_OUTPUT_RESERVE: u32 = 2_048;
+const OUTPUT_RESERVE_DIVISOR: u32 = 100;
+
+const CHARS_PER_TOKEN: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -389,6 +404,29 @@ impl Model {
             .map(|n| (n / 2).max(MIN_THINKING_BUDGET))
     }
 
+    /// Request snapshot for a prompt of `context_size` tokens: caps
+    /// `max_output_tokens` to the remaining context, minus a reserve covering
+    /// estimation slop (see [`MIN_OUTPUT_RESERVE`]). Strict OpenAI-compatible
+    /// servers (vLLM) 400 on `prompt + max_tokens > context window` even when
+    /// the prompt alone fits; lenient ones ignore the oversized cap, so the
+    /// clamp is invisible to them. An unknown window stays `None`: "don't
+    /// limit" is deliberate for llama.cpp / TensorX, and vLLM defaults an
+    /// omitted `max_tokens` to exactly the remaining context.
+    pub fn with_output_budget(&self, context_size: u32) -> Model {
+        let mut snapshot = self.clone();
+        if let Some(max) = self.max_output_tokens {
+            let reserve = (self.context_window / OUTPUT_RESERVE_DIVISOR).max(MIN_OUTPUT_RESERVE);
+            snapshot.max_output_tokens = Some(
+                self.context_window
+                    .saturating_sub(context_size)
+                    .saturating_sub(reserve)
+                    .min(max)
+                    .max(MIN_OUTPUT_BUDGET),
+            );
+        }
+        snapshot
+    }
+
     /// A model supports fast mode exactly when it carries fast-tier pricing, so
     /// capability and billing can never disagree. The provider gate keeps fast
     /// mode to Anthropic-based providers, resolved through the base manifest so
@@ -646,6 +684,36 @@ impl TokenUsage {
             + self.cache_creation as f64 * cache_write / PER_MILLION
             + self.cache_read as f64 * cache_read / PER_MILLION
     }
+}
+
+/// Counts message content only. The system prompt and the tool schemas, a five
+/// figure baseline on a full tool set, stay invisible here, so never let this
+/// replace a context size the provider measured.
+pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
+    if messages.is_empty() {
+        return 0;
+    }
+    let total_bytes: usize = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.len()),
+            ContentBlock::ToolResult { content, .. } => Some(content.len()),
+            ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
+            _ => None,
+        })
+        .sum();
+    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
+}
+
+/// What a strict server (see [`Model::with_output_budget`]) counts as the
+/// prompt: messages plus the system prompt and tool schemas. Use where no
+/// provider-measured context exists yet, e.g. the first request of a resumed
+/// session, and prefer `max(measured, estimate)` when one does.
+pub fn estimate_prompt_tokens(messages: &[Message], system: &str, tools: &Value) -> u32 {
+    let envelope_bytes = system.len() + serde_json::to_string(tools).unwrap_or_default().len();
+    estimate_message_tokens(messages) + (envelope_bytes / CHARS_PER_TOKEN) as u32
 }
 
 pub fn format_tokens(tokens: impl Into<u64>) -> String {
@@ -1264,5 +1332,40 @@ mod tests {
             }
         );
         assert_eq!(COUNTERS.billed(None).cost, None);
+    }
+
+    fn budget_model(context_window: u32, max_output: Option<u32>) -> Model {
+        let mut model = Model::from_spec("openai/gpt-4o").unwrap();
+        model.context_window = context_window;
+        model.max_output_tokens = max_output;
+        model
+    }
+
+    #[test_case(262_144, 162_145, Some(100_000), Some(97_378) ; "vllm_rejection_boundary")]
+    #[test_case(262_144, 62_145, Some(100_000), Some(100_000) ; "spare_context_leaves_cap_untouched")]
+    #[test_case(262_144, 300_000, Some(100_000), Some(MIN_OUTPUT_BUDGET) ; "window_exhausted_floors_at_one")]
+    #[test_case(262_144, 262_144, None, None ; "unknown_window_stays_unlimited")]
+    fn output_budget_respects_remaining_context(
+        window: u32,
+        used: u32,
+        cap: Option<u32>,
+        expected: Option<u32>,
+    ) {
+        let model = budget_model(window, cap);
+        assert_eq!(model.with_output_budget(used).max_output_tokens, expected);
+    }
+
+    /// The bug the estimate exists for: nothing was measured yet, the restored
+    /// history alone already crowds out the cap.
+    #[test]
+    fn resumed_session_clamps_from_prompt_estimate_alone() {
+        let model = budget_model(262_144, Some(100_000));
+        let history = vec![Message::user("x".repeat(162_145 * CHARS_PER_TOKEN))];
+        let estimate = estimate_prompt_tokens(&history, "", &Value::Array(vec![]));
+        assert_eq!(estimate, 162_145);
+        assert_eq!(
+            model.with_output_budget(estimate).max_output_tokens,
+            Some(97_378)
+        );
     }
 }

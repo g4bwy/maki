@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, Message, Model, RequestOptions, Role, StopReason, StreamResponse, TokenUsage,
+    estimate_message_tokens,
 };
 
 use super::compaction;
@@ -199,6 +200,21 @@ impl<'h> Agent<'h> {
         self
     }
 
+    /// Seeds the context gauge with a size measured by an earlier run of this
+    /// session (UI resume). Without it the first request sizes its output
+    /// budget from byte estimates alone, which miss the system prompt, the
+    /// tool schemas, and tokenizer slop.
+    pub fn with_context_size(mut self, context_size: u32) -> Self {
+        self.context_size = context_size;
+        self
+    }
+
+    /// What the run last had on gauge (measured or seeded), so the caller can
+    /// seed the next run of the same session.
+    pub fn context_size(&self) -> u32 {
+        self.context_size
+    }
+
     /// Cancellation is an ending, not a failure: it comes back as
     /// `Ok(DoneReason::Cancelled)` so callers only report real errors.
     pub async fn run(&mut self, input: AgentInput) -> Result<DoneReason, AgentError> {
@@ -315,6 +331,7 @@ impl<'h> Agent<'h> {
             &self.cancel,
             self.opts,
             self.session_id.as_ref(),
+            self.context_size,
         )
         .await
         {
@@ -620,29 +637,6 @@ impl<'h> Agent<'h> {
         }
         Ok(true)
     }
-}
-
-const CHARS_PER_TOKEN: usize = 4;
-
-/// Counts message content only. The system prompt and the tool schemas, a five
-/// figure baseline on a full tool set, stay invisible here, so never let this
-/// replace a context size the provider measured.
-pub fn estimate_message_tokens(messages: &[Message]) -> u32 {
-    if messages.is_empty() {
-        return 0;
-    }
-    let total_bytes: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.len()),
-            ContentBlock::ToolResult { content, .. } => Some(content.len()),
-            ContentBlock::ToolUse { input, .. } => Some(input.to_string().len()),
-            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
-            _ => None,
-        })
-        .sum();
-    (total_bytes.max(CHARS_PER_TOKEN) / CHARS_PER_TOKEN) as u32
 }
 
 #[cfg(test)]

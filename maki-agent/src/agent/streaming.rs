@@ -2,7 +2,10 @@ use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
 use maki_providers::retry::{MAX_TIMEOUT_RETRIES, RetryState};
-use maki_providers::{ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse};
+use maki_providers::{
+    ContentBlock, Message, Model, ProviderEvent, RequestOptions, StreamResponse,
+    estimate_prompt_tokens,
+};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
@@ -96,10 +99,17 @@ pub(crate) async fn stream_with_retry(
     cancel: &CancelToken,
     opts: RequestOptions,
     session_id: Option<&SessionRef>,
+    context_floor: u32,
 ) -> Result<StreamResponse, StreamError> {
     let opts = opts.clamped(model);
     let messages = maki_providers::adapt_images_for_model(model, messages);
     let messages = &*messages;
+    // Strict servers 400 on `prompt + max_tokens > context window`, and on the
+    // first request of a resumed session nothing was measured yet: take the
+    // better of the last measured size and what is about to be sent.
+    let mut measured_prompt = context_floor.max(estimate_prompt_tokens(messages, system, tools));
+    let mut request_model = model.with_output_budget(measured_prompt);
+    let mut overflow_recovery = true;
     let mut retry = RetryState::new();
     loop {
         let started = Instant::now();
@@ -109,7 +119,15 @@ pub(crate) async fn stream_with_retry(
             async move { forward_provider_events(prx, &event_tx).await }
         });
         let result = futures_lite::future::race(
-            provider.stream_message(model, messages, system, tools, &ptx, opts, session_id),
+            provider.stream_message(
+                &request_model,
+                messages,
+                system,
+                tools,
+                &ptx,
+                opts,
+                session_id,
+            ),
             async {
                 cancel.cancelled().await;
                 Err(AgentError::Cancelled)
@@ -121,12 +139,12 @@ pub(crate) async fn stream_with_retry(
         match result {
             Ok(mut r) => {
                 canonicalize_tool_names(&mut r.message);
-                emit_api_request(model, &r, opts, started.elapsed());
+                emit_api_request(&request_model, &r, opts, started.elapsed());
                 return Ok(r);
             }
             Err(AgentError::Cancelled) => return Err(StreamError::Cancelled { streamed }),
             Err(e) if e.is_retryable() => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                emit_api_error(&request_model, &e, retry.attempts() + 1, started.elapsed());
                 if e.should_rotate_key()
                     && let Ok(true) = provider.rotate_key().await
                 {
@@ -157,7 +175,25 @@ pub(crate) async fn stream_with_retry(
                 }
             }
             Err(e) => {
-                emit_api_error(model, &e, retry.attempts() + 1, started.elapsed());
+                // Some strict servers report the exact prompt length in the
+                // rejection; re-clamp against it once instead of failing the
+                // run because the local gauge ran optimistic.
+                if overflow_recovery
+                    && e.is_context_overflow()
+                    && let Some(n) = e.reported_prompt_tokens()
+                    && n > measured_prompt
+                {
+                    warn!(
+                        reported = n,
+                        gauge = measured_prompt,
+                        "server measured a longer prompt, re-clamping output budget"
+                    );
+                    measured_prompt = n;
+                    request_model = model.with_output_budget(n);
+                    overflow_recovery = false;
+                    continue;
+                }
+                emit_api_error(&request_model, &e, retry.attempts() + 1, started.elapsed());
                 return Err(e.into());
             }
         }
@@ -244,5 +280,90 @@ mod tests {
         let reported = error_description(&error);
         assert!(!reported.contains("private"));
         assert_eq!(reported, "API error (400)");
+    }
+
+    use std::sync::Mutex;
+
+    use maki_providers::provider::{BoxFuture, Provider};
+    use maki_providers::{StopReason, TokenUsage};
+
+    /// Verbatim shape of the captured vLLM 400.
+    const VLLM_REJECTION: &str = "This model's maximum context length is 262144 tokens. However, you requested 100000 output tokens and your prompt contains at least 162145 input tokens, for a total of at least 262145 tokens. (parameter=input_tokens, value=162145)";
+
+    struct BudgetSpy {
+        budgets: Mutex<Vec<Option<u32>>>,
+        responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
+    }
+
+    impl Provider for BudgetSpy {
+        fn stream_message<'a>(
+            &'a self,
+            model: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&maki_storage::id::SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async {
+                self.budgets.lock().unwrap().push(model.max_output_tokens);
+                self.responses.lock().unwrap().remove(0)
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn text_response() -> StreamResponse {
+        StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: "ok".into() }],
+                ..Default::default()
+            },
+            usage: TokenUsage::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }
+    }
+
+    #[test]
+    fn overflow_rejection_reclamps_and_retries_once() {
+        let spy = BudgetSpy {
+            budgets: Mutex::new(Vec::new()),
+            responses: Mutex::new(vec![
+                Err(AgentError::Api {
+                    status: 400,
+                    message: VLLM_REJECTION.into(),
+                }),
+                Ok(text_response()),
+            ]),
+        };
+        let mut model = Model::from_spec("openai/gpt-4o").unwrap();
+        model.context_window = 262_144;
+        model.max_output_tokens = Some(100_000);
+
+        let (raw_tx, _raw_rx) = flume::unbounded();
+        let event_tx = EventSender::new(raw_tx, 0);
+        let result = smol::block_on(stream_with_retry(
+            &spy,
+            &model,
+            &[],
+            "",
+            &Value::Array(vec![]),
+            &event_tx,
+            &CancelToken::none(),
+            RequestOptions::default(),
+            None,
+            0,
+        ));
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *spy.budgets.lock().unwrap(),
+            vec![Some(100_000), Some(97_378)]
+        );
     }
 }

@@ -32,6 +32,9 @@ pub(super) struct AgentLoop {
     tools: RequestTools,
     mcp: Option<McpSession>,
     history: History,
+    /// Gauge carried across respawns and runs: persisted context size on
+    /// resume, then the last value the finished run measured.
+    context_seed: u32,
     btw_system: Arc<ArcSwap<String>>,
     cancel_map: Arc<RunCancelMap>,
     init_cancel: CancelToken,
@@ -56,6 +59,7 @@ impl AgentLoop {
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         initial_history: Vec<Message>,
+        context_seed: u32,
         shared_history: SharedMessages,
         btw_system: Arc<ArcSwap<String>>,
         mcp_handle: Option<McpHandle>,
@@ -82,6 +86,7 @@ impl AgentLoop {
             tools: RequestTools::default(),
             mcp,
             history: History::restored(initial_history).with_mirror(shared_history),
+            context_seed,
             btw_system,
             cancel_map,
             init_cancel,
@@ -285,9 +290,11 @@ impl AgentLoop {
         .with_user_response_rx(Arc::clone(&self.answer_rx))
         .with_interrupt_source(Arc::clone(&self.queue) as Arc<dyn maki_agent::InterruptSource>)
         .with_cancel(cancel)
+        .with_context_size(self.context_seed)
         .with_mcp(self.mcp.clone());
 
         let result = agent.run(input).await;
+        self.context_seed = agent.context_size();
         drop(agent);
 
         self.clear_cancel_trigger(run_id);

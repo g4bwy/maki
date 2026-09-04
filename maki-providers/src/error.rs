@@ -89,6 +89,20 @@ impl AgentError {
         matches!(self, Self::Api { status: 401, .. })
     }
 
+    /// When a strict server rejects `prompt + max_tokens > window` it names
+    /// the exact prompt length, so a rejected request knows precisely where to
+    /// re-clamp. vLLM spells it twice:
+    /// "your prompt contains at least 162145 input tokens" and
+    /// "(parameter=input_tokens, value=162145)".
+    pub fn reported_prompt_tokens(&self) -> Option<u32> {
+        let Self::Api { message, .. } = self else {
+            return None;
+        };
+        let lower = message.to_lowercase();
+        count_after(&lower, "input_tokens, value=", None)
+            .or_else(|| count_after(&lower, "at least ", Some(" input tokens")))
+    }
+
     pub fn should_rotate_key(&self) -> bool {
         matches!(self, Self::Api { status, .. } if *status == 429 || *status == 401 || *status == 403)
     }
@@ -134,6 +148,18 @@ impl AgentError {
             _ => self.to_string(),
         }
     }
+}
+
+/// First integer right after `needle`, optionally requiring `suffix` to
+/// follow the digits immediately.
+fn count_after(hay: &str, needle: &str, suffix: Option<&str>) -> Option<u32> {
+    let start = hay.find(needle)? + needle.len();
+    let tail = &hay[start..];
+    let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || suffix.is_some_and(|s| !tail[digits..].starts_with(s)) {
+        return None;
+    }
+    tail[..digits].parse().ok()
 }
 
 impl<T> From<flume::SendError<T>> for AgentError {
@@ -254,5 +280,36 @@ mod tests {
         let err = api_msg(400, "request exceeds the available context size");
         assert!(err.is_context_overflow());
         assert!(!err.is_retryable());
+    }
+
+    // The captured vLLM body, verbatim from a mitmproxy log.
+    #[test]
+    fn reported_prompt_tokens_parses_vllm_param() {
+        let err = api_msg(
+            400,
+            r#"{"error":{"code":400,"message":"This model's maximum context length is 262144 tokens. However, you requested 100000 output tokens and your prompt contains at least 162145 input tokens, for a total of at least 262145 tokens. Please reduce the length of the input prompt or the number of requested output tokens. (parameter=input_tokens, value=162145)","param":"input_tokens","type":"BadRequestError"}}"#,
+        );
+        assert_eq!(err.reported_prompt_tokens(), Some(162145));
+    }
+
+    #[test]
+    fn reported_prompt_tokens_falls_back_to_prose() {
+        let err = api_msg(
+            400,
+            "your prompt contains at least 162145 input tokens, for a total of at least 262145 tokens",
+        );
+        assert_eq!(err.reported_prompt_tokens(), Some(162145));
+    }
+
+    #[test]
+    fn reported_prompt_tokens_none_when_absent() {
+        assert_eq!(
+            api_msg(400, "Input is too long for the model").reported_prompt_tokens(),
+            None
+        );
+        assert_eq!(
+            api_msg(400, "at least some words but no count").reported_prompt_tokens(),
+            None
+        );
     }
 }
