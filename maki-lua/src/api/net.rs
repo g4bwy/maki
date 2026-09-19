@@ -193,6 +193,9 @@ struct RequestParams {
     timeout: Duration,
     max_bytes: usize,
     retries: u32,
+    /// Keep only response lines starting with one of these. Empty disables
+    /// the filter.
+    line_prefixes: Vec<String>,
     /// `None` when the guard reached its verdict without DNS.
     pin: Option<DnsPin>,
 }
@@ -215,6 +218,9 @@ struct ResponseData {
 ///   `timeout` (integer) Timeout in seconds, max 120 (default 30).
 ///   `max_bytes` (integer) Max response size in bytes (default 5 MB).
 ///   `retry` (integer) Retries on 5xx errors (default 3).
+///   `line_prefixes` (table) Array of strings. Keep only the response
+///   lines that start with one of them. Filtering happens after the body
+///   is read, so `max_bytes` still caps the transfer.
 ///
 /// The response table has three fields: `body` (string), `status`
 /// (integer), and `content_type` (string).
@@ -295,6 +301,16 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         .and_then(|o| o.get::<u32>("retry").ok())
         .unwrap_or(MAX_RETRIES);
 
+    let line_prefixes = opts
+        .and_then(|o| o.get::<Table>("line_prefixes").ok())
+        .map(|tbl| {
+            tbl.sequence_values::<String>()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("invalid line_prefixes: {e}"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(RequestParams {
         url,
         method,
@@ -303,6 +319,7 @@ async fn extract_request_params(url: &str, opts: Option<&Table>) -> Result<Reque
         timeout,
         max_bytes,
         retries,
+        line_prefixes,
         pin,
     })
 }
@@ -425,6 +442,18 @@ fn build_client(params: &RequestParams) -> Result<HttpClient, String> {
     builder.build().map_err(|e| format!("client error: {e}"))
 }
 
+/// Keeps only the lines that start with one of the prefixes, so a caller never
+/// carries the lines it discards into the Lua VM.
+fn keep_matching_lines(body: &[u8], prefixes: &[String]) -> Vec<u8> {
+    let mut kept = Vec::new();
+    for line in body.split_inclusive(|byte| *byte == b'\n') {
+        if prefixes.iter().any(|p| line.starts_with(p.as_bytes())) {
+            kept.extend_from_slice(line);
+        }
+    }
+    kept
+}
+
 async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
     let mut response = send_with_retries(&build_client(&params)?, &params).await?;
@@ -473,6 +502,11 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, String> {
         return Err(format!("response too large: {} bytes", bytes.len()));
     }
 
+    let bytes = if params.line_prefixes.is_empty() {
+        bytes
+    } else {
+        keep_matching_lines(&bytes, &params.line_prefixes)
+    };
     let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(ResponseData {
         body,
@@ -816,6 +850,7 @@ mod tests {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_bytes: DEFAULT_MAX_BYTES,
             retries: 0,
+            line_prefixes: Vec::new(),
             pin: None,
         }
     }
@@ -1104,5 +1139,47 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k == ACCEPT_HEADER && v == ACCEPT_VALUE)
         );
+    }
+
+    #[test]
+    fn extract_params_line_prefixes_default_empty() {
+        assert!(
+            request_params(PUBLIC_URL, None)
+                .unwrap()
+                .line_prefixes
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extract_params_line_prefixes_collected() {
+        let lua = Lua::new();
+        let prefixes = lua.create_sequence_from([KEEP_PREFIX, "other"]).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("line_prefixes", prefixes).unwrap();
+        let params = request_params(PUBLIC_URL, Some(&opts)).unwrap();
+        assert_eq!(params.line_prefixes, [KEEP_PREFIX, "other"]);
+    }
+
+    #[test]
+    fn extract_params_line_prefixes_non_string_errors() {
+        let lua = Lua::new();
+        let prefixes = lua.create_sequence_from([true]).unwrap();
+        let opts = lua.create_table().unwrap();
+        opts.set("line_prefixes", prefixes).unwrap();
+        let Err(err) = request_params(PUBLIC_URL, Some(&opts)) else {
+            panic!("non-string line_prefixes accepted");
+        };
+        assert!(err.contains("line_prefixes"), "{err}");
+    }
+
+    const KEEP_PREFIX: &str = "vllm:generation_tokens_total";
+
+    #[test_case("vllm:a 1\nvllm:generation_tokens_total{e=\"0\"} 2.0\nvllm:b 3\n", "vllm:generation_tokens_total{e=\"0\"} 2.0\n" ; "lf_terminated")]
+    #[test_case("vllm:a 1\r\nvllm:generation_tokens_total 2.0\r\n", "vllm:generation_tokens_total 2.0\r\n" ; "crlf_terminated")]
+    #[test_case("vllm:generation_tokens_total 2.0", "vllm:generation_tokens_total 2.0" ; "no_trailing_newline")]
+    fn keep_matching_lines_keeps_only_prefixed_lines(body: &str, expected: &str) {
+        let kept = keep_matching_lines(body.as_bytes(), &[KEEP_PREFIX.to_string()]);
+        assert_eq!(String::from_utf8(kept).unwrap(), expected);
     }
 }
