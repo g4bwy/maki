@@ -603,6 +603,22 @@ case("validate_input", function()
   end
 end)
 
+case("unknown_command_points_at_the_edit_tool", function()
+  local cases = {
+    { { command = "edit", path = "notes.md" }, "notes%.md$" },
+    { { command = "str_replace" }, "<name>$" },
+  }
+  for _, c in ipairs(cases) do
+    local err = validate_input(c[1], "/home/u/mem")
+    assert(err and err:find("unknown command", 1, true), tostring(err))
+    assert(err:find("`edit` on /home/u/mem", 1, true), "edit hint expected, got: " .. err)
+    assert(err:find(c[2]), "expected '" .. c[2] .. "', got: " .. err)
+  end
+
+  local err = validate_input({ command = "edit" })
+  assert(not err:find("`edit`", 1, true), "no hint without a dir, got: " .. err)
+end)
+
 case_tmp("files_with_tags_lists_every_file_once", function(dir)
   eq(#h.files_with_tags(dir), 0, "empty dir lists nothing")
 

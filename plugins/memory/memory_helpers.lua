@@ -16,6 +16,7 @@ local SIZE_STYLE = "dim"
 local WRITE_REJECT_PREFIX = "invalid tag(s) rejected: "
 local READ_REJECT_PREFIX = "warning: ignored invalid tag(s): "
 local UNREADABLE_PREFIX = "warning: unreadable memory files: "
+local EDIT_HINT = "Notes are plain files; to change one, use `edit` on "
 local NO_MATCH_MSG = "no memory files matched any of the given tags; use `list` to see available tags"
 local PRUNE_ADVISORY = "Consider removing or consolidating stale memories to stay under " .. M.MAX_TAGS .. " tags."
 
@@ -135,15 +136,22 @@ function M.format_rejected(rejected)
   return table.concat(out, ", ")
 end
 
-function M.validate_input(input)
+-- `dir` only feeds the unknown-command hint: models trained on memory tools
+-- with in-tool edits (edit, str_replace, insert) land there, and the real
+-- path lets them recover with the `edit` tool in one turn.
+function M.validate_input(input, dir)
   local cmd = input.command
+  local has_path = input.path ~= nil and input.path ~= ""
   if not VALID_COMMANDS[cmd] then
-    return "unknown command '" .. tostring(cmd) .. "'. Valid commands: " .. table.concat(COMMANDS, ", ")
+    local msg = "unknown command '" .. tostring(cmd) .. "'. Valid commands: " .. table.concat(COMMANDS, ", ")
+    if dir then
+      msg = msg .. ". " .. EDIT_HINT .. maki.fs.joinpath(dir, has_path and input.path or "<name>")
+    end
+    return msg
   end
   if input.tags ~= nil and type(input.tags) ~= "table" then
     return "'tags' must be an array"
   end
-  local has_path = input.path ~= nil and input.path ~= ""
   local has_tags = type(input.tags) == "table" and #input.tags > 0
   if cmd == "read" then
     if has_path and has_tags then
