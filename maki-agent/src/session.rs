@@ -493,4 +493,32 @@ mod tests {
         drop(track);
         assert!(live_history(id).is_none());
     }
+    #[test_case(false ; "legacy_history")]
+    #[test_case(true ; "encrypted_reasoning")]
+    fn opaque_reasoning_survives_session_log(reasoning: bool) {
+        const CIPHERTEXT: &str = "encrypted-session-fixture";
+        let tmp = TempDir::new().unwrap();
+        let mut track = track_on(&tmp);
+        let mut message = Message::empty_marker();
+        if reasoning {
+            message.content.insert(0, ContentBlock::OpenAiReasoning {
+                item: serde_json::json!({"type":"reasoning","id":"rs_session","summary":[],"encrypted_content":CIPHERTEXT}),
+            });
+        }
+        let expected = serde_json::to_value(&message).unwrap();
+        push_turn(&mut track, MODEL_SPEC, |params| {
+            params.history.push(message)
+        });
+        let loaded = load(&tmp);
+        assert_eq!(
+            serde_json::to_value(&loaded.messages()[0]).unwrap(),
+            expected
+        );
+        assert!(
+            !loaded.messages()[0]
+                .first_text_content()
+                .unwrap()
+                .contains(CIPHERTEXT)
+        );
+    }
 }

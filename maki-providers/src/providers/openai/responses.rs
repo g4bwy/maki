@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,8 @@ pub(crate) fn build_body(
     body
 }
 
+/// One key for one conversation, so every turn of it is routed to the cache
+/// entry that already holds its prefix.
 pub(crate) fn apply_prompt_cache_key(body: &mut Value, key: Option<&str>) {
     if let Some(key) = key {
         body["prompt_cache_key"] = json!(key);
@@ -99,7 +101,8 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::OpenAiReasoning { .. } => {}
                     }
                 }
             }
@@ -118,7 +121,8 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::OpenAiReasoning { .. } => {}
                     }
                 }
 
@@ -144,6 +148,115 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
     }
 
     Value::Array(input)
+}
+
+/// The conversation as the plan wants it: Responses items rather than chat
+/// messages, with the reasoning items of earlier assistant turns put back in
+/// the order the model made them.
+pub(super) fn coding_plan_input(messages: &[Message]) -> Value {
+    let mut input = Vec::new();
+    for message in messages {
+        if !matches!(message.role, Role::Assistant) {
+            input.extend(
+                convert_input(std::slice::from_ref(message))
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+            continue;
+        }
+        for block in &message.content {
+            match block {
+                ContentBlock::OpenAiReasoning { item } => input.push(item.clone()),
+                ContentBlock::Text { text } => input.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                })),
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input: arguments,
+                    ..
+                } => input.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": arguments.to_string(),
+                })),
+                ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolResult { .. } => {}
+            }
+        }
+    }
+    Value::Array(input)
+}
+
+/// Whether an item can be handed back. The plan rejects reasoning it cannot
+/// decrypt, and an unfinished item would describe a turn that never happened.
+pub(super) fn replayable_reasoning(item: &Value) -> bool {
+    item["type"] == "reasoning"
+        && item["encrypted_content"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+        && item
+            .get("status")
+            .is_none_or(|status| status == "completed")
+}
+
+/// One output item as the content blocks maki keeps for it, or `None` when it
+/// is nothing maki can send back unchanged.
+fn output_item_content(item: &Value) -> Option<Vec<ContentBlock>> {
+    match item["type"].as_str()? {
+        "reasoning" if replayable_reasoning(item) => {
+            Some(vec![ContentBlock::OpenAiReasoning { item: item.clone() }])
+        }
+        "message" if item["role"] == "assistant" => item["content"]
+            .as_array()?
+            .iter()
+            .map(|part| {
+                if part["type"] != "output_text" {
+                    return None;
+                }
+                Some(ContentBlock::Text {
+                    text: part["text"].as_str()?.into(),
+                })
+            })
+            .collect(),
+        "function_call" => Some(vec![ContentBlock::tool_use(
+            item["call_id"].as_str()?,
+            item["name"].as_str()?,
+            serde_json::from_str(item["arguments"].as_str()?).ok()?,
+        )]),
+        _ => None,
+    }
+}
+
+/// The `output` array of a completed response as content blocks, or `None`
+/// when any item cannot be represented. Turning one down whole is what keeps
+/// a replay from dropping the item it was sent as.
+pub(super) fn output_content(output: &[Value]) -> Option<Vec<ContentBlock>> {
+    let mut content = Vec::new();
+    let mut first_text = true;
+    for item in output {
+        let blocks = output_item_content(item)?;
+        for mut block in blocks {
+            if let ContentBlock::Text { text } = &mut block {
+                if first_text {
+                    *text = text.trim_start().into();
+                    first_text = false;
+                }
+                if text.is_empty() {
+                    continue;
+                }
+            }
+            content.push(block);
+        }
+    }
+    Some(content)
 }
 
 pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
@@ -203,6 +316,20 @@ pub(crate) async fn do_stream(
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
+    plan: Plan,
+) -> Result<StreamResponse, AgentError> {
+    do_stream_inner(client, model, body, event_tx, auth, stream_timeout, plan).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_stream_inner(
+    client: &HttpClient,
+    model: &crate::model::Model,
+    body: &Value,
+    event_tx: &Sender<ProviderEvent>,
+    auth: &ResolvedAuth,
+    stream_timeout: Duration,
+    plan: Plan,
 ) -> Result<StreamResponse, AgentError> {
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
@@ -211,12 +338,33 @@ pub(crate) async fn do_stream(
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
     }
-    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    let mut body = body.into_owned();
+    let result = post_responses(
+        client,
+        model,
+        &body,
+        event_tx,
+        auth,
+        base,
+        stream_timeout,
+        plan,
+    )
+    .await;
     match result {
         Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
             reject_summary(base);
-            strip_summary(body.to_mut());
-            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+            strip_summary(&mut body);
+            post_responses(
+                client,
+                model,
+                &body,
+                event_tx,
+                auth,
+                base,
+                stream_timeout,
+                plan,
+            )
+            .await
         }
         result => result,
     }
@@ -231,6 +379,7 @@ async fn post_responses(
     auth: &ResolvedAuth,
     base: &str,
     stream_timeout: Duration,
+    plan: Plan,
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
@@ -238,7 +387,7 @@ async fn post_responses(
         .configure_request(
             Request::builder()
                 .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+                .uri(format!("{}{RESPONSES_PATH}", base.trim_end_matches('/')))
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
@@ -252,12 +401,12 @@ async fn post_responses(
 
     let response = client.send_async(request).await?;
     let status = response.status().as_u16();
-
     if status == 200 {
         parse_sse(
             BufReader::new(response.into_body()),
             event_tx,
             stream_timeout,
+            plan,
         )
         .await
     } else {
@@ -272,74 +421,126 @@ struct ToolAccumulator {
     arguments: String,
 }
 
+/// Who a Responses stream is for. The ChatGPT plan replays a turn's own
+/// reasoning items back on the next turn, so it needs the terminal output in
+/// full and in order, and a stream that lost a line cannot be trusted.
+/// Everyone else (xai, copilot, a local server, a custom gateway) keeps the
+/// lenient parser this code has always had.
+#[derive(Clone, Copy)]
+pub(crate) enum Plan {
+    Other,
+    Coding,
+}
+
+impl Plan {
+    fn coding(self) -> bool {
+        matches!(self, Self::Coding)
+    }
+}
+
 pub(crate) async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
+    plan: Plan,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
-
-    let mut text = String::new();
-    let mut reasoning_text = String::new();
-    let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
-    let mut usage = TokenUsage::default();
-    let mut stop_reason: Option<StopReason> = None;
-    let mut is_first_content = true;
+    let coding_plan = plan.coding();
+    let mut accumulator = if coding_plan {
+        ResponseAccumulator::coding_plan()
+    } else {
+        ResponseAccumulator::default()
+    };
     let mut deadline = Instant::now() + stream_timeout;
     let mut current_event = String::new();
-
     while let Some(line) =
         crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
     {
-        if let Some(event_type) = line.strip_prefix("event:") {
-            current_event = event_type.trim().to_string();
+        if line.is_empty() {
+            current_event.clear();
             continue;
         }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-
-        if current_event == "error" {
-            if let Ok(ev) = serde_json::from_str::<crate::providers::SseErrorPayload>(data) {
-                warn!(error_type = %ev.error.r#type, message = %ev.error.message, "SSE error in stream");
-                return Err(ev.into_agent_error());
-            }
-            let parsed: Value = serde_json::from_str(data).unwrap_or_default();
-            let message = parsed["message"]
-                .as_str()
-                .unwrap_or("unknown error")
-                .to_string();
-            return Err(AgentError::api(500, message));
+        if let Some(event) = line.strip_prefix("event:") {
+            current_event = event.trim().into();
+            continue;
         }
-
-        let parsed_event = if current_event.is_empty() {
-            serde_json::from_str::<Value>(data)
-                .ok()
-                .and_then(|value| value["type"].as_str().map(ToOwned::to_owned))
-                .unwrap_or_default()
-        } else {
-            current_event.clone()
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
         };
+        if data.trim() == "[DONE]" {
+            break;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+            if coding_plan {
+                return Err(AgentError::api(500, "malformed data in Responses stream"));
+            }
+            continue;
+        };
+        let event = if current_event.is_empty() {
+            parsed["type"].as_str().unwrap_or_default()
+        } else {
+            &current_event
+        };
+        if accumulator.push(event, &parsed, event_tx).await? {
+            break;
+        }
+    }
+    accumulator.finish()
+}
 
-        match parsed_event.as_str() {
+#[derive(Default)]
+pub(super) struct ResponseAccumulator {
+    text: String,
+    reasoning_text: String,
+    tool_accumulators: Vec<ToolAccumulator>,
+    usage: TokenUsage,
+    stop_reason: Option<StopReason>,
+    content_seen: bool,
+    completed: Option<Value>,
+    output_items: BTreeMap<u64, Value>,
+    /// Keep the encrypted reasoning items of the final output, so the next
+    /// turn of the same conversation can replay them.
+    coding_plan: bool,
+}
+
+impl ResponseAccumulator {
+    pub(super) fn coding_plan() -> Self {
+        Self {
+            coding_plan: true,
+            ..Self::default()
+        }
+    }
+
+    pub(super) async fn push(
+        &mut self,
+        event: &str,
+        parsed: &Value,
+        event_tx: &Sender<ProviderEvent>,
+    ) -> Result<bool, AgentError> {
+        if event == "error" {
+            if let Ok(error) =
+                serde_json::from_value::<crate::providers::SseErrorPayload>(parsed.clone())
+            {
+                return Err(error.into_agent_error());
+            }
+            return Err(AgentError::api(
+                500,
+                parsed["message"].as_str().unwrap_or("unknown error"),
+            ));
+        }
+        match event {
             "response.output_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
-                    let delta = if is_first_content {
-                        is_first_content = false;
-                        delta.trim_start().to_string()
-                    } else {
+                    let delta = if self.content_seen {
                         delta.to_string()
+                    } else {
+                        self.content_seen = true;
+                        delta.trim_start().to_string()
                     };
                     if !delta.is_empty() {
-                        text.push_str(&delta);
+                        self.text.push_str(&delta);
                         event_tx
                             .send_async(ProviderEvent::TextDelta { text: delta })
                             .await?;
@@ -348,14 +549,10 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.added" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let item = &parsed["item"];
                 let output_index = parsed["output_index"]
                     .as_u64()
-                    .unwrap_or(tool_accumulators.len() as u64);
+                    .unwrap_or(self.tool_accumulators.len() as u64);
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
@@ -367,7 +564,7 @@ pub(crate) async fn parse_sse(
                             })
                             .await?;
                     }
-                    tool_accumulators.push(ToolAccumulator {
+                    self.tool_accumulators.push(ToolAccumulator {
                         output_index,
                         call_id,
                         name,
@@ -377,10 +574,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.function_call_arguments.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let delta: Cow<'_, str> = if let Some(s) = parsed["delta"].as_str() {
                     Cow::Borrowed(s)
                 } else if let Some(obj) = parsed["delta"].as_object() {
@@ -390,9 +583,11 @@ pub(crate) async fn parse_sse(
                 };
                 if !delta.is_empty() {
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
-                        tool_accumulators.iter_mut().find(|a| a.output_index == idx)
+                        self.tool_accumulators
+                            .iter_mut()
+                            .find(|a| a.output_index == idx)
                     } else {
-                        tool_accumulators.last_mut()
+                        self.tool_accumulators.last_mut()
                     };
                     if let Some(acc) = acc {
                         acc.arguments.push_str(&delta);
@@ -401,10 +596,6 @@ pub(crate) async fn parse_sse(
             }
 
             "response.in_progress" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(pp) = parsed.get("prompt_progress") {
                     let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
                     let total = pp["total"].as_u64().unwrap_or(0) as u32;
@@ -420,11 +611,11 @@ pub(crate) async fn parse_sse(
             }
 
             "response.output_item.done" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let item = &parsed["item"];
+                let index = parsed["output_index"]
+                    .as_u64()
+                    .unwrap_or(self.output_items.len() as u64);
+                self.output_items.insert(index, item.clone());
                 if item["type"].as_str() == Some("function_call") {
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
@@ -436,11 +627,11 @@ pub(crate) async fn parse_sse(
                         String::new()
                     };
                     let acc = if let Some(idx) = parsed["output_index"].as_u64() {
-                        tool_accumulators
+                        self.tool_accumulators
                             .iter_mut()
                             .find(|acc| acc.output_index == idx)
                     } else {
-                        tool_accumulators.last_mut()
+                        self.tool_accumulators.last_mut()
                     };
                     if let Some(acc) = acc {
                         let should_emit_start = acc.name.is_empty() && !name.is_empty();
@@ -470,8 +661,8 @@ pub(crate) async fn parse_sse(
                                 })
                                 .await?;
                         }
-                        tool_accumulators.push(ToolAccumulator {
-                            output_index: tool_accumulators.len() as u64,
+                        self.tool_accumulators.push(ToolAccumulator {
+                            output_index: self.tool_accumulators.len() as u64,
                             call_id,
                             name,
                             arguments,
@@ -481,14 +672,10 @@ pub(crate) async fn parse_sse(
             }
 
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 if let Some(delta) = parsed["delta"].as_str()
                     && !delta.is_empty()
                 {
-                    reasoning_text.push_str(delta);
+                    self.reasoning_text.push_str(delta);
                     event_tx
                         .send_async(ProviderEvent::ThinkingDelta {
                             text: delta.to_string(),
@@ -497,25 +684,27 @@ pub(crate) async fn parse_sse(
                 }
             }
 
-            "response.reasoning_summary_part.added" if !reasoning_text.is_empty() => {
-                reasoning_text.push_str("\n\n");
+            "response.reasoning_summary_part.added" if !self.reasoning_text.is_empty() => {
+                self.reasoning_text.push_str("\n\n");
             }
 
             "response.completed" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let resp = &parsed["response"];
+                let mut completed = resp.clone();
+                if completed["output"].as_array().is_none_or(Vec::is_empty) {
+                    completed["output"] =
+                        Value::Array(self.output_items.values().cloned().collect());
+                }
+                self.completed = Some(completed);
 
                 if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
+                    self.usage = parse_usage(u);
                 }
 
                 let status = resp["status"].as_str().unwrap_or("completed");
-                stop_reason = Some(match status {
+                self.stop_reason = Some(match status {
                     "completed" => {
-                        if tool_accumulators.is_empty() {
+                        if self.tool_accumulators.is_empty() {
                             StopReason::EndTurn
                         } else {
                             StopReason::ToolUse
@@ -527,22 +716,20 @@ pub(crate) async fn parse_sse(
             }
 
             "response.incomplete" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let resp = &parsed["response"];
-                if let Some(u) = resp.get("usage") {
-                    usage = parse_usage(u);
+                let mut completed = resp.clone();
+                if completed["output"].as_array().is_none_or(Vec::is_empty) {
+                    completed["output"] =
+                        Value::Array(self.output_items.values().cloned().collect());
                 }
-                stop_reason = Some(StopReason::MaxTokens);
+                self.completed = Some(completed);
+                if let Some(u) = resp.get("usage") {
+                    self.usage = parse_usage(u);
+                }
+                self.stop_reason = Some(StopReason::MaxTokens);
             }
 
             "response.failed" => {
-                let parsed: Value = match serde_json::from_str(data) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
                 let error = &parsed["response"]["error"];
                 let message = error["message"]
                     .as_str()
@@ -557,44 +744,81 @@ pub(crate) async fn parse_sse(
 
             _ => {}
         }
+        Ok(matches!(
+            event,
+            "response.completed" | "response.incomplete"
+        ))
     }
 
-    let mut content_blocks: Vec<ContentBlock> = Vec::new();
+    pub(super) fn finish(self) -> Result<StreamResponse, AgentError> {
+        if self.stop_reason.is_none() && self.coding_plan {
+            return Err(AgentError::api(
+                500,
+                "Responses stream ended before a terminal event",
+            ));
+        }
+        let mut content_blocks: Vec<ContentBlock> = Vec::new();
 
-    if !reasoning_text.is_empty() {
-        content_blocks.push(ContentBlock::Thinking {
-            thinking: reasoning_text,
-            signature: None,
-        });
-    }
+        if !self.reasoning_text.is_empty() {
+            content_blocks.push(ContentBlock::Thinking {
+                thinking: self.reasoning_text,
+                signature: None,
+            });
+        }
 
-    if !text.is_empty() {
-        content_blocks.push(ContentBlock::Text { text });
-    }
+        if !self.text.is_empty() {
+            content_blocks.push(ContentBlock::Text { text: self.text });
+        }
 
-    for acc in tool_accumulators {
-        let input: Value = match serde_json::from_str(&acc.arguments) {
-            Ok(v) => {
-                debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
-                v
-            }
-            Err(e) => {
-                warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
-                Value::Object(Default::default())
-            }
+        for acc in self.tool_accumulators {
+            let input: Value = match serde_json::from_str(&acc.arguments) {
+                Ok(v) => {
+                    debug!(tool = %acc.name, json = %acc.arguments, "tool input JSON");
+                    v
+                }
+                Err(e) => {
+                    warn!(error = %e, tool = %acc.name, json = %acc.arguments, "malformed tool JSON, falling back to {{}}");
+                    Value::Object(Default::default())
+                }
+            };
+            content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+        }
+
+        // The terminal event carries the encrypted reasoning items, and only
+        // in the order the model produced them, so a coding plan turn takes its
+        // content from there. It is taken whole or not at all: keeping part of
+        // it would drop a tool call whose arguments were malformed, and the
+        // model only retries one it was told it got wrong.
+        if self.coding_plan
+            && let Some(ordered) = self
+                .completed
+                .as_ref()
+                .and_then(|response| response["output"].as_array())
+                .filter(|output| !output.is_empty())
+                .and_then(|output| output_content(output))
+        {
+            content_blocks.retain(|block| matches!(block, ContentBlock::Thinking { .. }));
+            content_blocks.extend(ordered);
+        }
+        let stop_reason = if self.stop_reason == Some(StopReason::EndTurn)
+            && content_blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        {
+            Some(StopReason::ToolUse)
+        } else {
+            self.stop_reason
         };
-        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+        Ok(StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: content_blocks,
+                ..Default::default()
+            },
+            usage: self.usage,
+            stop_reason,
+        })
     }
-
-    Ok(StreamResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: content_blocks,
-            ..Default::default()
-        },
-        usage,
-        stop_reason,
-    })
 }
 
 fn parse_usage(u: &Value) -> TokenUsage {
@@ -604,7 +828,6 @@ fn parse_usage(u: &Value) -> TokenUsage {
     let cached = u["input_tokens_details"]["cached_tokens"]
         .as_u64()
         .unwrap_or(0) as u32;
-
     TokenUsage {
         input: input_tokens.saturating_sub(cached),
         output: output_tokens,
@@ -665,6 +888,7 @@ mod tests {
     fn prompt_cache_key_is_optional() {
         let model = Model::from_spec("openai/gpt-5.6-luna").unwrap();
         let mut body = build_body(&model, &[], "", &json!([]));
+
         apply_prompt_cache_key(&mut body, Some("cache-probe"));
         assert_eq!(body["prompt_cache_key"], "cache-probe");
 
@@ -674,8 +898,15 @@ mod tests {
     }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
+        run_sse_plan(sse, Plan::Other).await
+    }
+
+    async fn run_sse_plan(
+        sse: &str,
+        plan: Plan,
+    ) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
-        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
+        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, plan).await;
         (result, rx.drain().collect())
     }
 
@@ -1258,5 +1489,172 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
             assert_eq!(resp.usage.output, 10);
             assert_eq!(resp.usage.cache_read, 40);
         })
+    }
+    const OPAQUE: &str = "encrypted-fixture";
+    const REASONING_ID: &str = "rs_fixture";
+    const OUTPUT_TEXT: &str = "answer";
+    const CALL_ID: &str = "call_fixture";
+
+    fn opaque_item() -> Value {
+        json!({"type":"reasoning", "id":REASONING_ID, "summary":[], "encrypted_content":OPAQUE})
+    }
+
+    #[test_case(false ; "terminal")]
+    #[test_case(true ; "item_done_fallback")]
+    fn interleaved_reasoning_retains_output_order(fallback: bool) {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let mut accumulator = ResponseAccumulator::coding_plan();
+            let output = vec![
+                opaque_item(),
+                json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":OUTPUT_TEXT}]}),
+                json!({"type":"function_call","call_id":CALL_ID,"name":TOOL_NAME,"arguments":"{}"}),
+                opaque_item(),
+            ];
+            for index in [3, 2, 1, 0, 0] {
+                accumulator
+                    .push(
+                        "response.output_item.done",
+                        &json!({"output_index":index,"item":output[index]}),
+                        &tx,
+                    )
+                    .await
+                    .unwrap();
+            }
+            accumulator.push("response.completed", &json!({"response":{"status":"completed","output":if fallback {vec![]} else {output.clone()}}}), &tx).await.unwrap();
+            let message = accumulator.finish().unwrap().message;
+            assert_eq!(
+                coding_plan_input(std::slice::from_ref(&message)),
+                json!(output)
+            );
+            assert_eq!(
+                convert_input(std::slice::from_ref(&message))
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(message.first_text_content(), Some(OUTPUT_TEXT));
+            let without_opaque = Message {
+                content: message
+                    .content
+                    .iter()
+                    .filter(|block| !block.is_thinking())
+                    .cloned()
+                    .collect(),
+                ..message.clone()
+            };
+            assert_eq!(
+                crate::tokens::estimate_message_tokens(&[message]),
+                crate::tokens::estimate_message_tokens(&[without_opaque])
+            );
+        });
+    }
+
+    #[test_case(json!(null), None, false ; "missing_encryption")]
+    #[test_case(json!(""), None, false ; "empty_encryption")]
+    #[test_case(json!(OPAQUE), Some("in_progress"), false ; "unfinished")]
+    #[test_case(json!(OPAQUE), Some("completed"), true ; "completed")]
+    #[test_case(json!(OPAQUE), None, true ; "no_status")]
+    fn only_complete_reasoning_replays(encryption: Value, status: Option<&str>, replay: bool) {
+        let mut item = opaque_item();
+        item["encrypted_content"] = encryption;
+        if let Some(status) = status {
+            item["status"] = json!(status);
+        }
+        assert_eq!(replayable_reasoning(&item), replay);
+        assert_eq!(
+            output_content(std::slice::from_ref(&item)).is_some(),
+            replay
+        );
+    }
+
+    #[test_case(json!({"type":"unknown"}) ; "unknown_item")]
+    #[test_case(json!({"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"refused"}]}) ; "unsupported_message")]
+    #[test_case(json!({"type":"function_call","arguments":"bad json"}) ; "malformed_tool")]
+    fn one_unusable_item_refuses_the_whole_output(unsupported: Value) {
+        assert!(output_content(&[opaque_item(), unsupported, opaque_item()]).is_none());
+    }
+
+    /// The maintainer case: a tool call whose arguments are not JSON cannot be
+    /// replayed, and it must still reach the model as an empty object so the
+    /// model sees the failure and retries, instead of the turn ending with a
+    /// tool stop reason and no tool call.
+    #[test]
+    fn malformed_tool_arguments_survive_a_refused_replay() {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let mut accumulator = ResponseAccumulator::coding_plan();
+            accumulator
+                .push(
+                    "response.output_item.added",
+                    &json!({"output_index":0,"item":{"type":"function_call","call_id":CALL_ID,"name":TOOL_NAME}}),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            accumulator
+                .push(
+                    "response.function_call_arguments.delta",
+                    &json!({"output_index":0,"delta":"not json"}),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            accumulator
+                .push(
+                    "response.completed",
+                    &json!({"response":{"status":"completed","output":[opaque_item(), {"type":"function_call","call_id":CALL_ID,"name":TOOL_NAME,"arguments":"not json"}]}}),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            let response = accumulator.finish().unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+            assert!(response.message.content.iter().any(
+                |block| matches!(block, ContentBlock::ToolUse { id, input, .. }
+                        if id == CALL_ID && input == &json!({}))
+            ));
+            assert!(
+                !response
+                    .message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::OpenAiReasoning { .. }))
+            );
+        });
+    }
+
+    #[test]
+    fn a_coding_plan_stream_has_to_reach_its_terminal_event() {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let err = parse_sse(
+                Cursor::new(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
+                        .as_ref(),
+                ),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                Plan::Coding,
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("terminal event"));
+            // Every other Responses caller still gets what it streamed.
+            let (tx, _rx) = flume::unbounded();
+            let lenient = parse_sse(
+                Cursor::new(
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
+                        .as_ref(),
+                ),
+                &tx,
+                TEST_STREAM_TIMEOUT,
+                Plan::Other,
+            )
+            .await
+            .unwrap();
+            assert_eq!(lenient.message.first_text_content(), Some("hi"));
+        });
     }
 }

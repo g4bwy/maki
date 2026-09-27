@@ -150,7 +150,9 @@ fn block_json(block: &ContentBlock) -> Option<serde_json::Value> {
     Some(match block {
         ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
         ContentBlock::Thinking { thinking, .. } => json!({ "type": "thinking", "text": thinking }),
-        ContentBlock::RedactedThinking { .. } => return None,
+        ContentBlock::RedactedThinking { .. } | ContentBlock::OpenAiReasoning { .. } => {
+            return None;
+        }
         ContentBlock::ToolUse {
             id, name, input, ..
         } => {

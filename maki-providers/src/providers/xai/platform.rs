@@ -189,6 +189,7 @@ impl Provider for Xai {
                             event_tx,
                             &auth,
                             stream_timeout,
+                            responses::Plan::Other,
                         )
                         .await
                     })
