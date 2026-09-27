@@ -304,6 +304,9 @@ impl<'h> Agent<'h> {
             self.emit_done(DoneReason::Dropped)?;
             return Ok(DoneReason::Dropped);
         };
+        if let Some(session) = &self.provider_session {
+            session.begin_turn();
+        }
         self.mode = mode;
         self.workflow = workflow;
         self.opts = RequestOptions { thinking, fast };

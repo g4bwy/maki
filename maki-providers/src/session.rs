@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use maki_storage::id::SessionRef;
 
+use crate::providers::openai::routing::RoutingState;
+
 /// Provider state owned by one conversation. It is handed to every request a
 /// session makes, including the ones a subagent or a compaction makes on its
 /// behalf, so a provider can keep whatever affinity it needs across turns.
@@ -18,6 +20,7 @@ struct SessionState {
     session_ref: SessionRef,
     thread_id: SessionRef,
     cache_key: String,
+    routing: RoutingState,
 }
 
 impl ProviderSession {
@@ -35,6 +38,7 @@ impl ProviderSession {
                 session_ref,
                 thread_id,
                 cache_key,
+                routing: RoutingState::default(),
             }),
         }
     }
@@ -60,6 +64,16 @@ impl ProviderSession {
         &self.inner.cache_key
     }
 
+    /// One user turn, which may be several requests: retries, a subagent, a
+    /// summary. Whatever the upstream handed the turn first is what the rest of
+    /// it has to keep sending, so this is where that state is dropped.
+    pub fn begin_turn(&self) {
+        self.inner.routing.clear();
+    }
+
+    pub(crate) fn routing(&self) -> &RoutingState {
+        &self.inner.routing
+    }
 }
 
 #[cfg(test)]
