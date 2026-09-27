@@ -515,14 +515,23 @@ fn apply_session_identity(
 }
 
 /// What only the ChatGPT plan accepts: the conversation as Responses items
-/// rather than a chat message list, plus the encrypted reasoning to replay on
-/// the next turn. Returns whether the request went to the plan.
-fn apply_coding_plan_request(auth: &ResolvedAuth, body: &mut Value, messages: &[Message]) -> bool {
+/// rather than a chat message list, the encrypted reasoning to replay on the
+/// next turn, and a hint of the route this turn is asking for. Returns whether
+/// the request went to the plan.
+fn apply_coding_plan_request(
+    auth: &mut ResolvedAuth,
+    body: &mut Value,
+    messages: &[Message],
+) -> bool {
     if !on_coding_plan(auth) {
         return false;
     }
     body["input"] = super::responses::coding_plan_input(messages);
     body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    auth.set_header(
+        super::routing::ROUTING_HINT_HEADER,
+        super::routing::routing_hint(body),
+    );
     true
 }
 
@@ -560,10 +569,18 @@ impl Provider for OpenAi {
                         );
                         apply_session_identity(&mut codex_auth, &mut body, session);
                         apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered.as_deref());
-                        let plan = if apply_coding_plan_request(&codex_auth, &mut body, messages) {
-                            super::responses::Plan::Coding
-                        } else {
-                            super::responses::Plan::Other
+                        let coding_plan =
+                            apply_coding_plan_request(&mut codex_auth, &mut body, messages);
+                        let routing = coding_plan
+                            .then(|| session.map(ProviderSession::routing))
+                            .flatten();
+                        if let Some(routing) = routing {
+                            routing.prepare(&codex_auth)?;
+                        }
+                        let plan = match routing {
+                            Some(routing) => super::responses::Plan::Coding(Some(routing)),
+                            None if coding_plan => super::responses::Plan::Coding(None),
+                            None => super::responses::Plan::Other,
                         };
                         super::responses::do_stream(
                             self.compat.client(),
@@ -745,7 +762,7 @@ mod tests {
     #[test_case(auth::CODING_PLAN_BASE_URL, true ; "coding_plan")]
     #[test_case("https://api.openai.com/v1", false ; "public_api")]
     #[test_case("https://other.example/v1", false ; "other_responses")]
-    fn encrypted_replay_is_coding_plan_only(base: &str, plan: bool) {
+    fn encrypted_replay_and_hint_are_coding_plan_only(base: &str, plan: bool) {
         const CIPHERTEXT: &str = "opaque-provider-gate";
         let mut auth = ResolvedAuth::for_test(Some(base.into()), vec![]);
         let model = Model::from_spec("openai/gpt-5.6-luna").unwrap();
@@ -757,8 +774,19 @@ mod tests {
             ..Default::default()
         }];
         let mut body = responses::build_body(&model, &messages, "", &json!([]));
-        assert_eq!(apply_coding_plan_request(&auth, &mut body, &messages), plan);
+        assert_eq!(
+            apply_coding_plan_request(&mut auth, &mut body, &messages),
+            plan
+        );
         assert_eq!(body.get("include").is_some(), plan);
+        assert_eq!(
+            auth.configure_request(Request::builder())
+                .body(())
+                .unwrap()
+                .headers()
+                .contains_key(super::super::routing::ROUTING_HINT_HEADER),
+            plan
+        );
         assert_eq!(body["input"].as_array().unwrap().len(), usize::from(plan));
         assert_eq!(body["store"], false);
     }

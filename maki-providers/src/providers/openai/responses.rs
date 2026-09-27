@@ -9,6 +9,7 @@ use isahc::{HttpClient, Request};
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use super::routing::{RoutingState, TURN_STATE_HEADER};
 use crate::model::Model;
 use crate::providers::openai_compat::tool_parameters;
 use crate::providers::{ResolvedAuth, sse_error_status};
@@ -316,7 +317,7 @@ pub(crate) async fn do_stream(
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
-    plan: Plan,
+    plan: Plan<'_>,
 ) -> Result<StreamResponse, AgentError> {
     do_stream_inner(client, model, body, event_tx, auth, stream_timeout, plan).await
 }
@@ -329,7 +330,7 @@ async fn do_stream_inner(
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
-    plan: Plan,
+    plan: Plan<'_>,
 ) -> Result<StreamResponse, AgentError> {
     let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
         message: "Responses API requires a base_url in auth".into(),
@@ -379,19 +380,19 @@ async fn post_responses(
     auth: &ResolvedAuth,
     base: &str,
     stream_timeout: Duration,
-    plan: Plan,
+    plan: Plan<'_>,
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
-    let request = auth
-        .configure_request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{}{RESPONSES_PATH}", base.trim_end_matches('/')))
-                .header("content-type", "application/json")
-                .header("user-agent", super::super::user_agent()),
-        )
-        .body(json_body)?;
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("{}{RESPONSES_PATH}", base.trim_end_matches('/')))
+        .header("content-type", "application/json")
+        .header("user-agent", super::super::user_agent());
+    if let Some(value) = plan.routing().and_then(RoutingState::value) {
+        builder = builder.header(TURN_STATE_HEADER, value);
+    }
+    let request = auth.configure_request(builder).body(json_body)?;
 
     debug!(
         model = %model.id,
@@ -401,6 +402,14 @@ async fn post_responses(
 
     let response = client.send_async(request).await?;
     let status = response.status().as_u16();
+    if let Some(routing) = plan.routing() {
+        routing.retain(
+            response
+                .headers()
+                .get(TURN_STATE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        );
+    }
     if status == 200 {
         parse_sse(
             BufReader::new(response.into_body()),
@@ -427,14 +436,22 @@ struct ToolAccumulator {
 /// Everyone else (xai, copilot, a local server, a custom gateway) keeps the
 /// lenient parser this code has always had.
 #[derive(Clone, Copy)]
-pub(crate) enum Plan {
+pub(crate) enum Plan<'a> {
     Other,
-    Coding,
+    /// `None` when the request has no session to remember a route for.
+    Coding(Option<&'a RoutingState>),
 }
 
-impl Plan {
+impl<'a> Plan<'a> {
     fn coding(self) -> bool {
-        matches!(self, Self::Coding)
+        matches!(self, Self::Coding(_))
+    }
+
+    fn routing(self) -> Option<&'a RoutingState> {
+        match self {
+            Self::Other => None,
+            Self::Coding(routing) => routing,
+        }
     }
 }
 
@@ -442,7 +459,7 @@ pub(crate) async fn parse_sse(
     reader: impl AsyncBufRead + Unpin,
     event_tx: &Sender<ProviderEvent>,
     stream_timeout: Duration,
-    plan: Plan,
+    plan: Plan<'_>,
 ) -> Result<StreamResponse, AgentError> {
     let mut lines = reader.lines();
     let coding_plan = plan.coding();
@@ -481,6 +498,9 @@ pub(crate) async fn parse_sse(
         } else {
             &current_event
         };
+        if let Some(routing) = plan.routing() {
+            routing.observe(event, &parsed);
+        }
         if accumulator.push(event, &parsed, event_tx).await? {
             break;
         }
@@ -839,9 +859,11 @@ fn parse_usage(u: &Value) -> TokenUsage {
 
 #[cfg(test)]
 mod tests {
+    use super::super::routing::ROUTING_HINT_HEADER;
     use super::*;
-    use futures_lite::io::Cursor;
+    use futures_lite::io::{AsyncReadExt, AsyncWriteExt, Cursor};
     use serde_json::json;
+    use smol::net::TcpListener;
     use test_case::test_case;
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
@@ -903,7 +925,7 @@ mod tests {
 
     async fn run_sse_plan(
         sse: &str,
-        plan: Plan,
+        plan: Plan<'_>,
     ) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
         let (tx, rx) = flume::unbounded();
         let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, plan).await;
@@ -1569,6 +1591,81 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
         );
     }
 
+    /// The plan hands a turn's route back on the response header of the first
+    /// request and on `response.metadata` of later ones. Whichever came first
+    /// is what every request of the turn sends, and a new turn starts clean.
+    #[test_case("response.metadata", false ; "response_event")]
+    #[test_case("codex.response.metadata", false ; "codex_event")]
+    #[test_case("response.metadata", true ; "header_before_event")]
+    fn http_turn_state_feedback(event: &'static str, header: bool) {
+        smol::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let auth = ResolvedAuth::for_test(
+                Some(format!("http://{}", listener.local_addr().unwrap())),
+                vec![(ROUTING_HINT_HEADER.into(), "model=gpt-test".into())],
+            );
+            let server = smol::spawn(async move {
+                for request_index in 0..3 {
+                    let (mut tcp, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        tcp.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                    }
+                    let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                    assert!(request.contains("x-codex-routing-hint: model=gpt-test"));
+                    assert_eq!(
+                        request.contains(&format!("{TURN_STATE_HEADER}: {OPAQUE}")),
+                        request_index == 1
+                    );
+                    let length: usize = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    tcp.read_exact(&mut vec![0; length]).await.unwrap();
+                    let body = format!(
+                        "data: {}\n\ndata: {}\n\n",
+                        json!({"type":event,"headers":{TURN_STATE_HEADER:if header { OUTPUT_TEXT } else { OPAQUE }}}),
+                        json!({"type":"response.completed","response":{"status":"completed","output":[opaque_item()]}})
+                    );
+                    let turn_header = if header {
+                        format!("{TURN_STATE_HEADER}: {OPAQUE}\r\n")
+                    } else {
+                        String::new()
+                    };
+                    tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n{turn_header}\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let routing = RoutingState::default();
+            let model = Model::from_spec("openai/gpt-5.6-luna").unwrap();
+            let client = HttpClient::new().unwrap();
+            let (tx, _rx) = flume::unbounded();
+            for index in 0..3 {
+                if index == 2 {
+                    routing.clear();
+                }
+                let response = do_stream(
+                    &client,
+                    &model,
+                    &json!({"model":model.id,"input":[]}),
+                    &tx,
+                    &auth,
+                    TEST_STREAM_TIMEOUT,
+                    Plan::Coding(Some(&routing)),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(&response.message.content[0], ContentBlock::OpenAiReasoning { item } if item == &opaque_item())
+                );
+            }
+            assert_eq!(routing.value().as_deref(), Some(OPAQUE));
+            server.await;
+        });
+    }
     #[test_case(json!({"type":"unknown"}) ; "unknown_item")]
     #[test_case(json!({"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"refused"}]}) ; "unsupported_message")]
     #[test_case(json!({"type":"function_call","arguments":"bad json"}) ; "malformed_tool")]
@@ -1636,7 +1733,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
                 ),
                 &tx,
                 TEST_STREAM_TIMEOUT,
-                Plan::Coding,
+                Plan::Coding(None),
             )
             .await
             .unwrap_err();
