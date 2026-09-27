@@ -848,11 +848,17 @@ fn parse_usage(u: &Value) -> TokenUsage {
     let cached = u["input_tokens_details"]["cached_tokens"]
         .as_u64()
         .unwrap_or(0) as u32;
+    let cache_write = u["input_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .unwrap_or(0) as u32;
+
     TokenUsage {
-        input: input_tokens.saturating_sub(cached),
+        input: input_tokens
+            .saturating_sub(cached)
+            .saturating_sub(cache_write),
         output: output_tokens,
         cache_read: cached,
-        cache_creation: 0,
+        cache_creation: cache_write,
         cost: None,
     }
 }
@@ -943,15 +949,16 @@ event: response.output_text.delta\n\
 data: {\"delta\":\" world\"}\n\
 \n\
 event: response.completed\n\
-data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40}}}}\n\
+data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":40,\"cache_write_tokens\":20}}}}\n\
 \n";
 
             let (resp, events) = run_sse(sse).await;
             let resp = resp.unwrap();
 
-            assert_eq!(resp.usage.input, 60);
+            assert_eq!(resp.usage.input, 40);
             assert_eq!(resp.usage.output, 10);
             assert_eq!(resp.usage.cache_read, 40);
+            assert_eq!(resp.usage.cache_creation, 20);
             assert_eq!(resp.stop_reason, Some(StopReason::EndTurn));
             assert!(
                 matches!(&resp.message.content[0], ContentBlock::Text { text } if text == "Hello world")
