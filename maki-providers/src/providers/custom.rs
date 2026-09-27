@@ -411,6 +411,7 @@ impl Provider for CustomOpenAiProvider {
                     event_tx,
                     &auth,
                     self.compat.stream_timeout(),
+                    responses::Plan::Other,
                 )
                 .await;
             }

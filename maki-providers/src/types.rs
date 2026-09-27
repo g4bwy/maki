@@ -261,6 +261,12 @@ pub enum ContentBlock {
     RedactedThinking {
         data: String,
     },
+    /// An OpenAI Responses reasoning item kept whole so the opaque ciphertext
+    /// inside it can be sent back on the next turn. Maki never reads it, other
+    /// providers drop it, and it is excluded from token estimates.
+    OpenAiReasoning {
+        item: Value,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -281,7 +287,10 @@ pub enum ContentBlock {
 
 impl ContentBlock {
     pub fn is_thinking(&self) -> bool {
-        matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+        matches!(
+            self,
+            Self::Thinking { .. } | Self::RedactedThinking { .. } | Self::OpenAiReasoning { .. }
+        )
     }
 }
 

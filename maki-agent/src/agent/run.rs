@@ -506,7 +506,7 @@ impl<'h> Agent<'h> {
         } else {
             if response.message.first_text_content().is_some() {
                 self.history.push(response.message);
-            } else if self.recover_stalled_turn()? {
+            } else if self.recover_stalled_turn(response.message)? {
                 return Ok(TurnOutcome::Continue);
             }
 
@@ -745,10 +745,18 @@ impl<'h> Agent<'h> {
 
     /// The turn came back without text, so [`Message::empty_marker`] takes its
     /// place in history. Returns true when the model was nudged to try again.
-    fn recover_stalled_turn(&mut self) -> Result<bool, AgentError> {
+    fn recover_stalled_turn(&mut self, response: Message) -> Result<bool, AgentError> {
         let nudges = self.history.recent_nudges();
         let nudge = nudges < MAX_NUDGES && self.history.has_recent_tool_results(RECENT_TOOL_WINDOW);
-        self.history.push(Message::empty_marker());
+        let mut marker = Message::empty_marker();
+        let mut content: Vec<_> = response
+            .content
+            .into_iter()
+            .filter(|block| matches!(block, ContentBlock::OpenAiReasoning { .. }))
+            .collect();
+        content.append(&mut marker.content);
+        marker.content = content;
+        self.history.push(marker);
         if !nudge {
             return Ok(false);
         }
@@ -2125,6 +2133,11 @@ mod tests {
         ],
         2, 0
         ; "no_nudge_when_text_after_tools"
+    )]
+    #[test_case(
+        [tool_call_response("glob", "t1")].into_iter().chain((0..=MAX_NUDGES).map(|_| assistant_response(vec![ContentBlock::OpenAiReasoning { item: serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}) }]))).collect(),
+        MAX_NUDGES + 2, MAX_NUDGES as usize
+        ; "opaque_reasoning_keeps_recovery_limit"
     )]
     #[test_case(
         vec![

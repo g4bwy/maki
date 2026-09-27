@@ -659,14 +659,14 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            session: Option<&'a ProviderSession>,
+            session_id: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
                 self.sessions
                     .lock()
                     .unwrap()
-                    .push(session.map(|s| s.session_ref().as_str().to_string()));
+                    .push(session_id.map(|s| s.session_ref().as_str().to_string()));
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 responses.remove(0)
@@ -1295,6 +1295,9 @@ mod tests {
                 },
                 ContentBlock::RedactedThinking {
                     data: "opaque".into(),
+                },
+                ContentBlock::OpenAiReasoning {
+                    item: serde_json::json!({"encrypted_content":"opaque"}),
                 },
             ],
             ..Default::default()

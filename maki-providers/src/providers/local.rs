@@ -152,6 +152,7 @@ impl Provider for LocalEndpoint {
                     event_tx,
                     &auth,
                     self.compat.stream_timeout(),
+                    responses::Plan::Other,
                 )
                 .await;
             }

@@ -295,6 +295,7 @@ impl Copilot {
             event_tx,
             &resolved,
             self.stream_timeout,
+            responses::Plan::Other,
         )
         .await
     }

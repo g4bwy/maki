@@ -514,6 +514,18 @@ fn apply_session_identity(
     }
 }
 
+/// What only the ChatGPT plan accepts: the conversation as Responses items
+/// rather than a chat message list, plus the encrypted reasoning to replay on
+/// the next turn. Returns whether the request went to the plan.
+fn apply_coding_plan_request(auth: &ResolvedAuth, body: &mut Value, messages: &[Message]) -> bool {
+    if !on_coding_plan(auth) {
+        return false;
+    }
+    body["input"] = super::responses::coding_plan_input(messages);
+    body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    true
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -548,6 +560,11 @@ impl Provider for OpenAi {
                         );
                         apply_session_identity(&mut codex_auth, &mut body, session);
                         apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered.as_deref());
+                        let plan = if apply_coding_plan_request(&codex_auth, &mut body, messages) {
+                            super::responses::Plan::Coding
+                        } else {
+                            super::responses::Plan::Other
+                        };
                         super::responses::do_stream(
                             self.compat.client(),
                             model,
@@ -555,6 +572,7 @@ impl Provider for OpenAi {
                             event_tx,
                             &codex_auth,
                             stream_timeout,
+                            plan,
                         )
                         .await
                     })
@@ -663,7 +681,7 @@ mod tests {
 
     use super::super::responses;
     use super::*;
-    use crate::ThinkingConfig;
+    use crate::{ContentBlock, Message, Role, ThinkingConfig};
 
     const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -719,6 +737,30 @@ mod tests {
         for header in ["session-id", "thread-id", "x-client-request-id"] {
             assert!(!request.headers().contains_key(header));
         }
+    }
+
+    /// The plan takes the conversation back as Responses items, encrypted
+    /// reasoning included, and keeps the response off the server. Nothing the
+    /// plan has never heard of is sent: an unsupported parameter is a 400.
+    #[test_case(auth::CODING_PLAN_BASE_URL, true ; "coding_plan")]
+    #[test_case("https://api.openai.com/v1", false ; "public_api")]
+    #[test_case("https://other.example/v1", false ; "other_responses")]
+    fn encrypted_replay_is_coding_plan_only(base: &str, plan: bool) {
+        const CIPHERTEXT: &str = "opaque-provider-gate";
+        let mut auth = ResolvedAuth::for_test(Some(base.into()), vec![]);
+        let model = Model::from_spec("openai/gpt-5.6-luna").unwrap();
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::OpenAiReasoning {
+                item: json!({"type":"reasoning","encrypted_content":CIPHERTEXT}),
+            }],
+            ..Default::default()
+        }];
+        let mut body = responses::build_body(&model, &messages, "", &json!([]));
+        assert_eq!(apply_coding_plan_request(&auth, &mut body, &messages), plan);
+        assert_eq!(body.get("include").is_some(), plan);
+        assert_eq!(body["input"].as_array().unwrap().len(), usize::from(plan));
+        assert_eq!(body["store"], false);
     }
 
     #[test_case("gpt-5.6-luna")]

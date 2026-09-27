@@ -165,6 +165,7 @@ fn is_replayable(block: &ContentBlock) -> bool {
     match block {
         ContentBlock::Text { text } => !text.trim().is_empty(),
         ContentBlock::Thinking { signature, .. } => signature.is_some(),
+        ContentBlock::OpenAiReasoning { .. } => false,
         _ => true,
     }
 }
@@ -430,10 +431,12 @@ impl EventParser {
 
 #[cfg(test)]
 mod tests {
+    use crate::{ContentBlock, Message, Role};
     use test_case::test_case;
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, long_context_window, strip_long_context,
+        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, build_wire_messages, long_context_window,
+        strip_long_context,
     };
 
     #[test_case("claude-opus-4-8-1m", "claude-opus-4-8" ; "strips_suffix")]
@@ -447,5 +450,25 @@ mod tests {
     fn long_context_window_follows_suffix(model_id: &str, expected: Option<u32>) {
         assert_eq!(long_context_window(model_id), expected);
         assert!(LONG_CONTEXT_SUFFIX.ends_with("1m"));
+    }
+    #[test_case(())]
+    fn opaque_reasoning_is_omitted(_: ()) {
+        const CIPHERTEXT: &str = "encrypted-other-provider-fixture";
+        let messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::OpenAiReasoning {
+                    item: serde_json::json!({"type":"reasoning", "encrypted_content":CIPHERTEXT}),
+                },
+                ContentBlock::Text {
+                    text: "visible".into(),
+                },
+            ],
+            ..Default::default()
+        }];
+        let wire = serde_json::to_value(build_wire_messages(&messages)).unwrap();
+        assert!(!wire.to_string().contains(CIPHERTEXT));
+        assert!(!wire.to_string().contains("open_ai_reasoning"));
+        assert!(wire.to_string().contains("visible"));
     }
 }
