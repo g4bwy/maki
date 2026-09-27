@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
@@ -105,6 +106,7 @@ pub struct AgentParams {
     pub tool_output_lines: ToolOutputLines,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
+    pub provider_session: Option<ProviderSession>,
     pub task_id: Option<Arc<str>>,
     pub mailbox: Option<SessionMailbox>,
     pub timeouts: maki_providers::Timeouts,
@@ -156,6 +158,7 @@ pub struct Agent<'h> {
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
     session_id: Option<SessionRef>,
+    provider_session: Option<ProviderSession>,
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -201,6 +204,7 @@ impl<'h> Agent<'h> {
             overflow_recoveries: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            provider_session: params.provider_session,
             task_id: params.task_id,
             mailbox: params.mailbox,
             file_access: params.file_access,
@@ -437,7 +441,7 @@ impl<'h> Agent<'h> {
                 tools: tools.as_ref(),
                 opts: self.opts,
                 output_budget: self.config.max_turn_output,
-                session_id: self.session_id.as_ref(),
+                session: self.provider_session.as_ref(),
                 retry: self.timeouts.retry,
             },
             Some(self.gauge),
@@ -541,6 +545,7 @@ impl<'h> Agent<'h> {
         AgentHooks {
             registry: &self.registry,
             session_id: self.session_id.as_ref(),
+            provider_session: self.provider_session.as_ref(),
             task_id: self.task_id.as_deref(),
             model: &self.model,
             cancel: &self.cancel,
@@ -776,6 +781,7 @@ impl<'h> Agent<'h> {
             event_tx: self.event_tx.clone(),
             mode: self.mode.clone(),
             session_id: self.session_id.clone(),
+            provider_session: self.provider_session.clone(),
             task_id: self.task_id.clone(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
@@ -866,6 +872,7 @@ impl<'h> Agent<'h> {
         let hooks = AgentHooks {
             registry: &self.registry,
             session_id: self.session_id.as_ref(),
+            provider_session: self.provider_session.as_ref(),
             task_id: self.task_id.as_deref(),
             model: &self.model,
             cancel: &self.cancel,
@@ -1068,7 +1075,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 self.requests.lock().unwrap().push(CapturedRequest {
@@ -1105,7 +1112,7 @@ mod tests {
             _: &'a Value,
             ptx: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 if let Some(text) = self.delta {
@@ -1200,6 +1207,7 @@ mod tests {
                     Arc::default(),
                 )),
                 session_id: None,
+                provider_session: None,
                 task_id: None,
                 mailbox: None,
                 timeouts: maki_providers::Timeouts::default(),
@@ -1843,7 +1851,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
                 let mut remaining = self.0.lock().unwrap();

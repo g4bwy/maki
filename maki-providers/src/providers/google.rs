@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::ProviderSession;
 use flume::Sender;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 use isahc::{AsyncReadResponseExt, HttpClient, Request};
-use maki_storage::id::{MakiId, SessionRef};
+use maki_storage::id::MakiId;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
@@ -252,7 +253,7 @@ impl Provider for Google {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
     }

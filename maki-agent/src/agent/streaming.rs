@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::time::{Duration, Instant};
 
 use maki_providers::provider::Provider;
@@ -6,7 +7,6 @@ use maki_providers::{
     ContentBlock, ContextGauge, Message, Model, Overflow, ProviderEvent, RequestOptions,
     StreamResponse, estimate_prompt_tokens,
 };
-use maki_storage::id::SessionRef;
 use serde_json::Value;
 use tracing::warn;
 
@@ -176,7 +176,7 @@ pub(crate) struct StreamRequest<'a> {
     /// Output tokens this kind of turn may generate. A summary needs far less
     /// than a coding turn, so the caller decides.
     pub output_budget: u32,
-    pub session_id: Option<&'a SessionRef>,
+    pub session: Option<&'a ProviderSession>,
     pub retry: RetryPolicy,
 }
 
@@ -197,7 +197,7 @@ pub(crate) async fn stream_with_retry(
         tools,
         opts,
         output_budget,
-        session_id,
+        session,
         retry,
     } = req;
     let opts = opts.clamped(model);
@@ -240,7 +240,7 @@ pub(crate) async fn stream_with_retry(
         // retry slept on a server `Retry-After` never pays for the attempt it
         // woke up to make.
         let result = cancel
-            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session_id))
+            .race(provider.stream_message(model, messages, system, tools, &ptx, opts, session))
             .await
             .unwrap_or(Err(AgentError::Cancelled));
         drop(ptx);
@@ -594,7 +594,7 @@ mod tests {
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let prompt = (estimate_prompt_tokens(messages, system, tools) as f32
@@ -665,7 +665,7 @@ mod tests {
                 tools: &json!([]),
                 opts: RequestOptions::default(),
                 output_budget: TURN_BUDGET,
-                session_id: None,
+                session: None,
                 retry,
             },
             gauge,
@@ -719,7 +719,7 @@ mod tests {
                     tools: &json!([]),
                     opts: RequestOptions::default(),
                     output_budget: TURN_BUDGET,
-                    session_id: None,
+                    session: None,
                     retry: RetryPolicy::default(),
                 },
                 None,
@@ -865,7 +865,7 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            _: Option<&'a SessionRef>,
+            _: Option<&'a ProviderSession>,
         ) -> maki_providers::provider::BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 let key = self.pool.current().to_owned();

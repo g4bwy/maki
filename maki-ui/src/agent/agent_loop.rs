@@ -1,3 +1,4 @@
+use maki_providers::ProviderSession;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -61,6 +62,7 @@ pub(super) struct AgentLoop {
     answer_rx: Arc<async_lock::Mutex<flume::Receiver<String>>>,
     queue: Arc<QueueReceiver>,
     session_id: SessionRef,
+    provider_session: ProviderSession,
     mailbox: SessionMailbox,
     timeouts: maki_providers::Timeouts,
     lua_handle: EventHandle,
@@ -91,6 +93,7 @@ impl AgentLoop {
     ) -> Self {
         let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
         Self {
+            provider_session: ProviderSession::new(resumed.id.clone()),
             session_id: resumed.id,
             model_slot,
             config,
@@ -233,6 +236,7 @@ impl AgentLoop {
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.session_id),
+            provider_session: Some(&self.provider_session),
             task_id: None,
             model: &slot.model,
             cancel,
@@ -321,6 +325,7 @@ impl AgentLoop {
                 tool_output_lines: self.tool_output_lines,
                 permissions: Arc::clone(&self.permissions),
                 session_id: Some(self.session_id.clone()),
+                provider_session: Some(self.provider_session.clone()),
                 task_id: None,
                 mailbox: Some(self.mailbox.clone()),
                 timeouts: self.timeouts,

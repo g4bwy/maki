@@ -276,6 +276,13 @@ pub(crate) fn refresh_tokens(tokens: &OAuthTokens) -> Result<OAuthTokens, AgentE
 
 pub(crate) const CODING_PLAN_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 
+/// Whether a resolved base URL is the ChatGPT coding plan rather than a key on
+/// the public API. The plan routes on conversation headers the public API has
+/// never heard of.
+pub(crate) fn is_coding_plan_base(base: &str) -> bool {
+    base.trim_end_matches('/') == CODING_PLAN_BASE_URL
+}
+
 pub(crate) fn build_oauth_resolved(tokens: &OAuthTokens) -> Result<ResolvedAuth, AgentError> {
     ResolvedAuth::bearer(PROVIDER, &tokens.access)
 }

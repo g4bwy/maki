@@ -1,8 +1,8 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
 use maki_storage::StateDir;
-use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
 use serde::Deserialize;
 use serde_json::Value;
@@ -212,7 +212,11 @@ fn supports_plan_fast(
     discovery_complete: bool,
 ) -> FastSupport {
     let account_id = auth
-        .filter(|auth| auth.base_url.as_deref() == Some(auth::CODING_PLAN_BASE_URL))
+        .filter(|auth| {
+            auth.base_url
+                .as_deref()
+                .is_some_and(super::auth::is_coding_plan_base)
+        })
         .and_then(plan_account_id);
     let Some(account_id) = account_id else {
         return FastSupport::Unsupported;
@@ -486,6 +490,30 @@ fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
     }
 }
 
+fn on_coding_plan(auth: &ResolvedAuth) -> bool {
+    auth.base_url
+        .as_deref()
+        .is_some_and(super::auth::is_coding_plan_base)
+}
+
+/// The identity a conversation keeps for its whole life: one cache key so
+/// every turn of it lands on the same cached prefix, and the thread headers
+/// the ChatGPT plan routes on. A subagent shares the key and not the thread.
+fn apply_session_identity(
+    auth: &mut ResolvedAuth,
+    body: &mut Value,
+    session: Option<&ProviderSession>,
+) {
+    super::responses::apply_prompt_cache_key(body, session.map(ProviderSession::cache_key));
+    let Some(session) = session.filter(|_| on_coding_plan(auth)) else {
+        return;
+    };
+    auth.set_header("session-id", session.cache_key().to_owned());
+    for header in ["thread-id", "x-client-request-id"] {
+        auth.set_header(header, session.thread_id().to_owned());
+    }
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -495,7 +523,7 @@ impl Provider for OpenAi {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let mut buf = String::new();
@@ -510,7 +538,7 @@ impl Provider for OpenAi {
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
-                        let codex_auth = self.codex_auth()?;
+                        let mut codex_auth = self.codex_auth()?;
                         let mut body = super::responses::build_body(model, messages, system, tools);
                         super::responses::apply_responses_reasoning(
                             &mut body,
@@ -518,6 +546,7 @@ impl Provider for OpenAi {
                             model,
                             &dialect,
                         );
+                        apply_session_identity(&mut codex_auth, &mut body, session);
                         apply_plan_fast(&mut body, opts.fast, &codex_auth, discovered.as_deref());
                         super::responses::do_stream(
                             self.compat.client(),
@@ -627,12 +656,70 @@ impl Provider for OpenAi {
 
 #[cfg(test)]
 mod tests {
+    use isahc::Request;
+    use maki_storage::id::SessionRef;
     use serde_json::json;
     use test_case::test_case;
 
     use super::super::responses;
     use super::*;
     use crate::ThinkingConfig;
+
+    const SESSION_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test_case(auth::CODING_PLAN_BASE_URL, true ; "coding_plan")]
+    #[test_case(CONFIG.base_url, false ; "public_api")]
+    fn session_identity_headers(base: &str, plan: bool) {
+        let parent = ProviderSession::new(SESSION_ID.parse::<SessionRef>().unwrap());
+        let session = parent.child();
+        assert_ne!(session.thread_id(), session.cache_key());
+        let mut auth = ResolvedAuth::new("openai", vec![])
+            .unwrap()
+            .with_base_url(Some(base.into()));
+        // Twice, because one auth is reused for every turn of a session and
+        // the headers have to overwrite rather than stack.
+        for _ in 0..2 {
+            let mut body = json!({});
+            apply_session_identity(&mut auth, &mut body, Some(&session));
+            let request = auth.configure_request(Request::builder()).body(()).unwrap();
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                Some(session.cache_key())
+            );
+            for (header, expected) in [
+                ("session-id", plan.then_some(session.cache_key())),
+                ("thread-id", plan.then_some(session.thread_id())),
+                ("x-client-request-id", plan.then_some(session.thread_id())),
+            ] {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(header)
+                        .map(|value| value.to_str().unwrap()),
+                    expected
+                );
+                assert_eq!(
+                    request.headers().get_all(header).iter().count(),
+                    usize::from(expected.is_some())
+                );
+            }
+        }
+    }
+
+    #[test_case(auth::CODING_PLAN_BASE_URL ; "coding_plan")]
+    #[test_case(CONFIG.base_url ; "public_api")]
+    fn a_request_without_a_session_carries_no_identity(base: &str) {
+        let mut auth = ResolvedAuth::new("openai", vec![])
+            .unwrap()
+            .with_base_url(Some(base.into()));
+        let mut body = json!({});
+        apply_session_identity(&mut auth, &mut body, None);
+        assert!(body.get("prompt_cache_key").is_none());
+        let request = auth.configure_request(Request::builder()).body(()).unwrap();
+        for header in ["session-id", "thread-id", "x-client-request-id"] {
+            assert!(!request.headers().contains_key(header));
+        }
+    }
 
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
