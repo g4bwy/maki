@@ -613,6 +613,10 @@ async fn session(
             tool_output_lines: maki_config::ToolOutputLines::default(),
             permissions: Arc::clone(&agent_ctx.permissions),
             session_id: agent_ctx.session_id.clone(),
+            provider_session: agent_ctx
+                .provider_session
+                .as_ref()
+                .map(maki_providers::ProviderSession::child),
             task_id: Some(Arc::from(ui_id.as_str())),
             mailbox: None,
             timeouts: agent_ctx.timeouts,

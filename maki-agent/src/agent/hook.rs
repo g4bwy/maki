@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use maki_providers::Model;
+use maki_providers::{Model, ProviderSession};
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
@@ -69,6 +69,9 @@ pub trait AgentHook: Send + Sync + 'static {
 pub struct AgentHooks<'a> {
     pub registry: &'a ToolRegistry,
     pub session_id: Option<&'a SessionRef>,
+    /// The provider half of the same session, so a summary request rides the
+    /// cache prefix of the conversation it summarises.
+    pub provider_session: Option<&'a ProviderSession>,
     pub task_id: Option<&'a str>,
     pub model: &'a Model,
     pub cancel: &'a CancelToken,

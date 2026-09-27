@@ -154,8 +154,8 @@ impl App {
                     tool_use_id: tool_id.clone(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
-                    thinking: chat.opts.map(|o| o.thinking.into()),
-                    fast: chat.opts.is_some_and(|o| o.fast),
+                    thinking: chat.opts.as_ref().map(|o| o.thinking.into()),
+                    fast: chat.opts.as_ref().is_some_and(|o| o.fast),
                 }
             })
             .collect();

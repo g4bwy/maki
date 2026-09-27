@@ -43,6 +43,12 @@ pub(crate) fn build_body(
     body
 }
 
+pub(crate) fn apply_prompt_cache_key(body: &mut Value, key: Option<&str>) {
+    if let Some(key) = key {
+        body["prompt_cache_key"] = json!(key);
+    }
+}
+
 pub(crate) fn apply_responses_reasoning(
     body: &mut Value,
     thinking: ThinkingConfig,
@@ -653,6 +659,18 @@ mod tests {
             converted[0]["parameters"],
             json!({"type": "object", "properties": {}})
         );
+    }
+
+    #[test]
+    fn prompt_cache_key_is_optional() {
+        let model = Model::from_spec("openai/gpt-5.6-luna").unwrap();
+        let mut body = build_body(&model, &[], "", &json!([]));
+        apply_prompt_cache_key(&mut body, Some("cache-probe"));
+        assert_eq!(body["prompt_cache_key"], "cache-probe");
+
+        let mut body = build_body(&model, &[], "", &json!([]));
+        apply_prompt_cache_key(&mut body, None);
+        assert!(body.get("prompt_cache_key").is_none());
     }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {

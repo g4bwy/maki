@@ -1,7 +1,7 @@
+use crate::ProviderSession;
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
-use maki_storage::id::SessionRef;
 use serde_json::{Value, json};
 
 use maki_config::providers::Protocol;
@@ -242,9 +242,10 @@ impl Provider for OpenRouter {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        session_id: Option<&'a SessionRef>,
+        session: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
+            let session_id = session.map(ProviderSession::session_ref);
             let auth = self.auth.lock().unwrap().clone();
             let mut buf = String::new();
             let system = super::with_prefix(&self.system_prefix, system, &mut buf);

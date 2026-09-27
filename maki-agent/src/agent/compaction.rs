@@ -211,7 +211,7 @@ pub(super) async fn compact_history(
                 tools: &empty_tools,
                 opts: RequestOptions::default(),
                 output_budget: SUMMARY_OUTPUT_BUDGET,
-                session_id: hooks.session_id,
+                session: hooks.provider_session,
                 retry,
             },
             // A stripped, collapsed rewrite of the transcript, far smaller than
@@ -602,8 +602,8 @@ mod tests {
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
-        ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        ContentBlock, Message, Model, ProviderEvent, ProviderSession, RequestOptions, Role,
+        StopReason, StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
     use serde_json::Value;
@@ -659,14 +659,14 @@ mod tests {
             _: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
             _: RequestOptions,
-            session_id: Option<&'a SessionRef>,
+            session: Option<&'a ProviderSession>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
                 self.requests.lock().unwrap().push(messages.to_vec());
                 self.sessions
                     .lock()
                     .unwrap()
-                    .push(session_id.map(|s| s.as_str().to_string()));
+                    .push(session.map(|s| s.session_ref().as_str().to_string()));
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 responses.remove(0)
@@ -712,9 +712,20 @@ mod tests {
         model: &'a Model,
         cancel: &'a CancelToken,
     ) -> AgentHooks<'a> {
+        test_hooks_with_provider(registry, session_id, None, model, cancel)
+    }
+
+    fn test_hooks_with_provider<'a>(
+        registry: &'a ToolRegistry,
+        session_id: Option<&'a SessionRef>,
+        provider_session: Option<&'a ProviderSession>,
+        model: &'a Model,
+        cancel: &'a CancelToken,
+    ) -> AgentHooks<'a> {
         AgentHooks {
             registry,
             session_id,
+            provider_session,
             task_id: None,
             model,
             cancel,
@@ -753,7 +764,7 @@ mod tests {
         provider: &MockProvider,
         history: &mut History,
         carry_len: usize,
-        session_id: Option<&SessionRef>,
+        session: Option<&ProviderSession>,
     ) {
         let (raw_tx, _rx) = flume::unbounded();
         let registry = ToolRegistry::new();
@@ -764,7 +775,13 @@ mod tests {
             &model,
             history,
             &EventSender::new(raw_tx, 0),
-            &test_hooks(&registry, session_id, &model, &cancel),
+            &test_hooks_with_provider(
+                &registry,
+                session.map(ProviderSession::session_ref),
+                session,
+                &model,
+                &cancel,
+            ),
             &AgentConfig::default(),
             None,
             carry_len,
@@ -1489,11 +1506,11 @@ mod tests {
         smol::block_on(async {
             let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
             let mut history = History::new(vec![Message::user("work".into())]);
-            let session = SessionRef::generate();
+            let session = ProviderSession::new(SessionRef::generate());
             summarize_history(&provider, &mut history, 0, Some(&session)).await;
 
             let sessions = provider.sessions.lock().unwrap();
-            assert_eq!(sessions[0].as_deref(), Some(session.as_str()));
+            assert_eq!(sessions[0].as_deref(), Some(session.session_ref().as_str()));
         });
     }
 

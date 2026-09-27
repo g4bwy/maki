@@ -7,7 +7,6 @@ use maki_config::providers::{
     Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env, resolve_base_url,
     resolve_protocol,
 };
-use maki_storage::id::SessionRef;
 use tracing::warn;
 
 use super::ResolvedAuth;
@@ -15,6 +14,7 @@ use super::anthropic::shared;
 use super::catalog;
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::ProviderSession;
 use crate::model::{FastPricing, Model, ModelInfo, ModelPricing, ModelTier, ThinkingSupport};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::Timeouts;
@@ -396,7 +396,7 @@ impl Provider for CustomOpenAiProvider {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        _session: Option<&'a ProviderSession>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
