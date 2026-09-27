@@ -282,6 +282,8 @@ struct CodexUsageWindow {
 
 pub struct OpenAi {
     compat: OpenAiCompatProvider,
+    timeouts: crate::providers::Timeouts,
+    transport: super::websocket::Transport,
     auth: Arc<Mutex<ResolvedAuth>>,
     storage: Option<StateDir>,
     system_prefix: Option<String>,
@@ -297,6 +299,8 @@ impl OpenAi {
         let resolved = auth::resolve(&storage)?;
         let compat = OpenAiCompatProvider::new(&CONFIG, timeouts);
         Ok(Self {
+            timeouts,
+            transport: super::websocket::Transport::from_env(),
             resolved_base_url: resolve_openai_base_url(),
             compat,
             auth: Arc::new(Mutex::new(resolved)),
@@ -310,6 +314,8 @@ impl OpenAi {
         timeouts: crate::providers::Timeouts,
     ) -> Self {
         Self {
+            timeouts,
+            transport: super::websocket::Transport::from_env(),
             resolved_base_url: resolve_openai_base_url(),
             compat: OpenAiCompatProvider::new(&CONFIG, timeouts),
             auth,
@@ -582,6 +588,21 @@ impl Provider for OpenAi {
                             None if coding_plan => super::responses::Plan::Coding(None),
                             None => super::responses::Plan::Other,
                         };
+                        if coding_plan
+                            && let Some(session) = session
+                            && let Some(response) = super::websocket::stream(
+                                session,
+                                model,
+                                &body,
+                                event_tx,
+                                &codex_auth,
+                                self.timeouts,
+                                self.transport,
+                            )
+                            .await?
+                        {
+                            return Ok(response);
+                        }
                         super::responses::do_stream(
                             self.compat.client(),
                             model,

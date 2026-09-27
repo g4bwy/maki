@@ -516,7 +516,7 @@ pub(super) struct ResponseAccumulator {
     usage: TokenUsage,
     stop_reason: Option<StopReason>,
     content_seen: bool,
-    completed: Option<Value>,
+    pub(super) completed: Option<Value>,
     output_items: BTreeMap<u64, Value>,
     /// Keep the encrypted reasoning items of the final output, so the next
     /// turn of the same conversation can replay them.
@@ -768,6 +768,47 @@ impl ResponseAccumulator {
             event,
             "response.completed" | "response.incomplete"
         ))
+    }
+
+    pub(super) fn replay_output(&self) -> Option<&Value> {
+        let completed = self.completed.as_ref()?;
+        let output = completed["output"].as_array()?;
+        if output.is_empty() {
+            return None;
+        }
+        let content = output_content(output)?;
+        let text: String = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if text != self.text {
+            return None;
+        }
+        let tools: Vec<_> = content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id, name, input)),
+                _ => None,
+            })
+            .collect();
+        if tools.len() != self.tool_accumulators.len()
+            || !self.tool_accumulators.iter().all(|acc| {
+                tools.iter().any(|(id, name, input)| {
+                    **id == acc.call_id
+                        && **name == acc.name
+                        && serde_json::from_str::<Value>(&acc.arguments).ok().as_ref()
+                            == Some(*input)
+                })
+            })
+        {
+            return None;
+        }
+        Some(completed)
     }
 
     pub(super) fn finish(self) -> Result<StreamResponse, AgentError> {
@@ -1524,6 +1565,10 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
     const OUTPUT_TEXT: &str = "answer";
     const CALL_ID: &str = "call_fixture";
 
+    fn message_item(text: &str) -> Value {
+        json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]})
+    }
+
     fn opaque_item() -> Value {
         json!({"type":"reasoning", "id":REASONING_ID, "summary":[], "encrypted_content":OPAQUE})
     }
@@ -1673,6 +1718,36 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
             server.await;
         });
     }
+    /// A continuation is only safe when what the model streamed is exactly
+    /// what the terminal event reports: the two are replayed as one history.
+    /// A continuation is only safe when what the model streamed is exactly
+    /// what the terminal event reports: the two are replayed as one history.
+    #[test_case(OUTPUT_TEXT, true ; "matches")]
+    #[test_case("half an answer", false ; "differs")]
+    fn a_continuation_needs_the_stream_to_match_its_output(streamed: &str, replays: bool) {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let mut accumulator = ResponseAccumulator::coding_plan();
+            accumulator
+                .push(
+                    "response.output_text.delta",
+                    &json!({"delta":streamed}),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            accumulator
+                .push(
+                    "response.completed",
+                    &json!({"response":{"status":"completed","output":[opaque_item(), message_item(OUTPUT_TEXT)]}}),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            assert_eq!(accumulator.replay_output().is_some(), replays);
+        });
+    }
+
     #[test_case(json!({"type":"unknown"}) ; "unknown_item")]
     #[test_case(json!({"type":"message","role":"assistant","content":[{"type":"refusal","refusal":"refused"}]}) ; "unsupported_message")]
     #[test_case(json!({"type":"function_call","arguments":"bad json"}) ; "malformed_tool")]

@@ -305,7 +305,7 @@ impl<'h> Agent<'h> {
             return Ok(DoneReason::Dropped);
         };
         if let Some(session) = &self.provider_session {
-            session.begin_turn();
+            session.begin_turn().await;
         }
         self.mode = mode;
         self.workflow = workflow;

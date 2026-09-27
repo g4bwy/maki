@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use maki_storage::id::SessionRef;
+use smol::lock::Mutex;
 
 use crate::providers::openai::routing::RoutingState;
+use crate::providers::openai::websocket::ResponsesSession;
 
 /// Provider state owned by one conversation. It is handed to every request a
 /// session makes, including the ones a subagent or a compaction makes on its
@@ -21,6 +23,7 @@ struct SessionState {
     thread_id: SessionRef,
     cache_key: String,
     routing: RoutingState,
+    responses: Mutex<ResponsesSession>,
 }
 
 impl ProviderSession {
@@ -39,6 +42,7 @@ impl ProviderSession {
                 thread_id,
                 cache_key,
                 routing: RoutingState::default(),
+                responses: Mutex::new(ResponsesSession::default()),
             }),
         }
     }
@@ -67,12 +71,19 @@ impl ProviderSession {
     /// One user turn, which may be several requests: retries, a subagent, a
     /// summary. Whatever the upstream handed the turn first is what the rest of
     /// it has to keep sending, so this is where that state is dropped.
-    pub fn begin_turn(&self) {
+    pub async fn begin_turn(&self) {
+        // Held for the lock alone: a turn already on the socket must finish
+        // writing its continuation state before a new one may clear it.
+        let _responses = self.inner.responses.lock().await;
         self.inner.routing.clear();
     }
 
     pub(crate) fn routing(&self) -> &RoutingState {
         &self.inner.routing
+    }
+
+    pub(crate) fn responses(&self) -> &Mutex<ResponsesSession> {
+        &self.inner.responses
     }
 }
 
