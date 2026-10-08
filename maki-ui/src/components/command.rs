@@ -179,6 +179,7 @@ struct Match {
 
 pub struct CommandPalette {
     selected: usize,
+    scroll_offset: usize,
     filtered: Vec<Match>,
     custom: Arc<[CustomCommand]>,
     mcp_reader: McpSnapshotReader,
@@ -210,6 +211,7 @@ impl CommandPalette {
         let nucleo = Self::build_nucleo(&custom_commands, &prompts, &lua_commands);
         Self {
             selected: 0,
+            scroll_offset: 0,
             filtered: Vec::new(),
             custom: custom_commands,
             mcp_reader,
@@ -443,8 +445,22 @@ impl CommandPalette {
 
     pub fn close(&mut self) {
         self.filtered.clear();
+        self.scroll_offset = 0;
         self.current_arg_count = 0;
         self.current_bang = false;
+    }
+
+    fn ensure_visible(&mut self, visible: usize) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + visible {
+            self.scroll_offset = self.selected + 1 - visible;
+        }
+        // A filter that shrinks the list can leave the offset deep in empty
+        // space, where the selection alone would pin a one-row window.
+        self.scroll_offset = self
+            .scroll_offset
+            .min(self.filtered.len().saturating_sub(visible));
     }
 
     pub fn move_up(&mut self) {
@@ -536,16 +552,19 @@ impl CommandPalette {
         self.lua_commands.iter().find(|c| c.name.as_ref() == name)
     }
 
-    pub fn view(&self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
-        let filtered = &self.filtered;
-        if filtered.is_empty() {
+    pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        if self.filtered.is_empty() {
             return None;
         }
 
-        let popup_height = (filtered.len() as u16).min(input_area.y);
+        let popup_height = (self.filtered.len() as u16).min(input_area.y);
         if popup_height == 0 {
             return None;
         }
+        self.ensure_visible(popup_height as usize);
+        let start = self.scroll_offset;
+        let filtered = &self.filtered;
+        let end = (start + popup_height as usize).min(filtered.len());
 
         const GAP: usize = 2;
         let max_name = filtered
@@ -569,10 +588,11 @@ impl CommandPalette {
         };
 
         let t = theme::current();
-        let lines: Vec<Line> = filtered
+        let lines: Vec<Line> = filtered[start..end]
             .iter()
             .enumerate()
-            .map(|(i, m)| {
+            .map(|(row, m)| {
+                let i = start + row;
                 let name = self.item_name(m);
                 let desc = self.item_description(m);
                 let selected = i == self.selected;
@@ -646,6 +666,8 @@ impl CommandPalette {
 mod tests {
     use super::*;
     use maki_agent::{McpPromptArg, McpSnapshot};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use test_case::test_case;
 
     fn empty_snapshot() -> McpSnapshotReader {
@@ -1142,5 +1164,92 @@ mod tests {
         assert_eq!(updated_lua, 2);
         assert!(p.find_lua_command("/old").is_none());
         assert!(p.find_lua_command("/new1").is_some());
+    }
+
+    fn many_custom(n: usize) -> Arc<[CustomCommand]> {
+        Arc::from(
+            (0..n)
+                .map(|i| CustomCommand {
+                    name: format!("cmd{i:02}"),
+                    description: "d".into(),
+                    content: String::new(),
+                    scope: maki_agent::command::CommandScope::User,
+                    accepts_args: false,
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn render_rows(p: &mut CommandPalette, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let input_area = Rect::new(0, height - 1, width, 1);
+        terminal
+            .draw(|frame| {
+                p.view(frame, input_area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let area = buffer.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn view_scrolls_to_keep_the_selection_on_screen() {
+        let mut p = synced_with_custom("/", many_custom(30));
+        let last = p.filtered.len() - 1;
+        p.selected = last;
+        let last_name = p.item_name(&p.filtered[last]).to_string();
+        let first_name = p.item_name(&p.filtered[0]).to_string();
+
+        let text = render_rows(&mut p, 60, 10);
+        assert!(
+            text.contains(&last_name),
+            "selected item off screen:\n{text}"
+        );
+        assert!(
+            !text.contains(&first_name),
+            "window did not scroll:\n{text}"
+        );
+
+        p.selected = 0;
+        let text = render_rows(&mut p, 60, 10);
+        assert!(
+            text.contains(&first_name),
+            "scroll did not return to top:\n{text}"
+        );
+    }
+
+    #[test]
+    fn view_keeps_the_window_when_selection_is_already_visible() {
+        let mut p = synced_with_custom("/", many_custom(30));
+        p.selected = 5;
+        let first_name = p.item_name(&p.filtered[0]).to_string();
+        let text = render_rows(&mut p, 60, 10);
+        assert!(
+            text.contains(&first_name),
+            "window scrolled for no reason:\n{text}"
+        );
+    }
+
+    #[test]
+    fn view_clamps_the_window_after_the_list_shrinks() {
+        let mut p = synced_with_custom("/", many_custom(30));
+        p.selected = p.filtered.len() - 1;
+        render_rows(&mut p, 60, 10);
+
+        p.sync("/cmd0");
+        let first_name = p.item_name(&p.filtered[0]).to_string();
+        let text = render_rows(&mut p, 60, 20);
+        assert!(
+            text.contains(&first_name),
+            "window stayed scrolled after the filter shrank the list:\n{text}"
+        );
     }
 }
